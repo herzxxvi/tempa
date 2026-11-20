@@ -55,15 +55,19 @@ type client struct {
 	r    *bufio.Reader
 }
 
+// testIO is the I/O loop the tests in this file run the server with. The Linux tests run all of
+// them a second time on the epoll loop.
+var testIO = IONetpoll
+
 func start(t *testing.T, h Handler) (*Server, *client) {
 	t.Helper()
 	ln, err := Listen()
 	if err != nil {
 		t.Fatal(err)
 	}
-	srv := &Server{Handler: h, Token: "secret", DefaultHost: "fallback:1"}
+	srv := &Server{Handler: h, Token: "secret", DefaultHost: "fallback:1", IO: testIO}
 	go srv.Serve(ln)
-	t.Cleanup(func() { ln.Close() })
+	t.Cleanup(func() { srv.Shutdown(ln) })
 	conn, err := net.Dial("tcp", "127.0.0.1:"+strconv.Itoa(ln.Addr().(*net.TCPAddr).Port))
 	if err != nil {
 		t.Fatal(err)
@@ -564,5 +568,62 @@ func TestBufferGrowthIsBounded(t *testing.T) {
 	c.send("\r\n\r\nGET /after-blank-lines HTTP/1.1\r\nHost: h\r\n\r\n")
 	if res := c.read(true); res.status != 200 || !strings.Contains(res.body, "/after-blank-lines") {
 		t.Fatalf("blank lines before a request: %d %s", res.status, res.body)
+	}
+}
+
+// A chunked upload that arrives in hundreds of reads is decoded incrementally: each read continues
+// where the last one stopped, whatever the boundaries between reads and chunks are.
+func TestChunkedBodyInManyPieces(t *testing.T) {
+	_, c := start(t, func(c *Ctx) {
+		sum := uint32(0)
+		for _, b := range c.Body {
+			sum = sum*31 + uint32(b)
+		}
+		c.Scratch = strconv.AppendInt(c.Scratch[:0], int64(len(c.Body)), 10)
+		c.Scratch = append(c.Scratch, ' ')
+		c.Scratch = strconv.AppendUint(c.Scratch, uint64(sum), 10)
+		c.JSON(200, c.Scratch)
+	})
+	// 400 chunks of varying size, about 3 MiB in all.
+	var encoded strings.Builder
+	var plain []byte
+	x := uint32(9)
+	for i := 0; i < 400; i++ {
+		size := 1 + (i*7919)%15000
+		chunk := make([]byte, size)
+		for j := range chunk {
+			x = x*1664525 + 1013904223
+			chunk[j] = byte(x >> 24)
+		}
+		plain = append(plain, chunk...)
+		encoded.WriteString(strconv.FormatInt(int64(size), 16) + "\r\n")
+		encoded.Write(chunk)
+		encoded.WriteString("\r\n")
+	}
+	encoded.WriteString("0\r\n\r\n")
+	sum := uint32(0)
+	for _, b := range plain {
+		sum = sum*31 + uint32(b)
+	}
+	want := strconv.Itoa(len(plain)) + " " + strconv.FormatUint(uint64(sum), 10)
+
+	for _, piece := range []int{1 << 20, 4099, 613} {
+		wire := "POST /chunks HTTP/1.1\r\nHost: h\r\nTransfer-Encoding: chunked\r\n\r\n" + encoded.String() +
+			"GET /next HTTP/1.1\r\nHost: h\r\n\r\n"
+		go func() {
+			for len(wire) > 0 {
+				n := min(piece, len(wire))
+				if _, err := io.WriteString(c.conn, wire[:n]); err != nil {
+					return
+				}
+				wire = wire[n:]
+			}
+		}()
+		if res := c.read(true); res.status != 200 || res.body != want {
+			t.Fatalf("pieces of %d: %d %q, want %q", piece, res.status, res.body, want)
+		}
+		if res := c.read(true); res.status != 200 || res.body != "0 0" {
+			t.Fatalf("request after the chunked one (pieces of %d): %d %q", piece, res.status, res.body)
+		}
 	}
 }

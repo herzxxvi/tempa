@@ -49,12 +49,15 @@ type Server struct {
 	Token string
 	// DefaultHost stands in for a missing Host header when handlers build absolute URLs.
 	DefaultHost string
+	// IO selects the socket I/O loop: IONetpoll (also the meaning of "") or IOEpoll.
+	IO string
 
 	once        sync.Once
 	bearer      []byte // "Bearer <Token>", the exact header value the suite's clients send
 	defaultHost []byte
 	seq         atomic.Uint64
 	pool        sync.Pool
+	stopping    atomic.Bool
 }
 
 func (s *Server) init() {
@@ -98,9 +101,34 @@ func Listen() (*net.TCPListener, error) {
 	}
 }
 
-// Serve accepts connections until the listener is closed.
+// The two ways the engine can do its socket I/O. Everything above the sockets (parsing, dispatch,
+// response assembly, buffer management) is the same code in both.
+const (
+	// IONetpoll is the portable default: one goroutine per connection on Go's net package.
+	IONetpoll = "netpoll"
+	// IOEpoll is a single-threaded, level-triggered epoll loop on raw system calls (Linux only):
+	// one wait, one read and one write per exchange, and nothing for the Go scheduler to do.
+	IOEpoll = "epoll"
+)
+
+// Serve serves connections until the listener is closed (or, for the epoll loop, until Shutdown).
+// With IO set to IOEpoll on a platform that has no epoll loop, it serves with IONetpoll.
 func (s *Server) Serve(ln *net.TCPListener) error {
 	s.init()
+	if s.IO == IOEpoll && EpollSupported {
+		return s.serveEpoll(ln)
+	}
+	return s.serveNetpoll(ln)
+}
+
+// Shutdown makes Serve return: it closes the listener and, in the epoll loop, every connection.
+// The netpoll loop's established connections end when their clients close them.
+func (s *Server) Shutdown(ln *net.TCPListener) {
+	s.stopping.Store(true)
+	ln.Close()
+}
+
+func (s *Server) serveNetpoll(ln *net.TCPListener) error {
 	for {
 		nc, err := ln.AcceptTCP()
 		if err != nil {
@@ -125,8 +153,61 @@ func isClosed(err error) bool {
 	return err == net.ErrClosed
 }
 
-// ServeConn runs the request loop of one connection and closes it when the loop ends. It is exported
-// so tests can drive the engine over any net.Conn.
+// answer handles every complete request buffered in c and appends the responses to c.out, in
+// order. A body that is known to be incomplete is not re-parsed until enough bytes have arrived.
+// Afterwards c.closeAfter says whether the connection ends once c.out has been written. This is
+// the whole of request handling; the I/O loops only move bytes in and out around it.
+func (s *Server) answer(c *Ctx) {
+	for c.start < c.end && c.end-c.start >= c.need {
+		used, code := c.parse(c.in[c.start:c.end])
+		if code == needMore {
+			break
+		}
+		if code != 0 {
+			c.refuse(code)
+			return
+		}
+		s.dispatch(c)
+		c.start += used
+		c.scanned, c.need, c.sent100, c.wantContinue = 0, 0, false, false
+		if c.closeAfter {
+			return
+		}
+	}
+	if c.wantContinue && !c.sent100 {
+		c.sent100 = true
+		c.out = append(c.out, continue100...)
+	}
+}
+
+// refuse answers a request the engine itself rejects and marks the connection for closing.
+func (c *Ctx) refuse(status int) {
+	c.replied, c.extra, c.closeAfter = false, c.extra[:0], true
+	c.JSON(status, errorBody(status))
+}
+
+// settle prepares for the next read once c.out has been written: consumed bytes are dropped,
+// oversized buffers given back, and room is made for the rest of a pending request. It returns
+// false when that request has outgrown the size limit (an endless chunked body, a flood of blank
+// lines); a 413 is then waiting in c.out and the connection must close after it.
+func (c *Ctx) settle() bool {
+	if c.start == c.end {
+		c.start, c.end = 0, 0
+		c.shrink()
+	} else if c.start > 0 {
+		c.end = copy(c.in, c.in[c.start:c.end])
+		c.start = 0
+	}
+	if !c.room() {
+		c.refuse(413)
+		return false
+	}
+	return true
+}
+
+// ServeConn runs the request loop of one connection on the calling goroutine and closes the
+// connection when the loop ends. It is the netpoll I/O loop, exported so tests can drive the engine
+// over any net.Conn.
 func (s *Server) ServeConn(nc net.Conn) {
 	s.init()
 	c := s.pool.Get().(*Ctx)
@@ -138,25 +219,7 @@ func (s *Server) ServeConn(nc net.Conn) {
 	}()
 	last := false // the socket reported EOF or an error together with data: answer it, then stop
 	for {
-		// Answer every complete request that is buffered. A body that is known to be incomplete is
-		// not re-parsed until enough bytes have arrived.
-		for c.start < c.end && c.end-c.start >= c.need {
-			used, code := c.parse(c.in[c.start:c.end])
-			if code == needMore {
-				break
-			}
-			if code != 0 {
-				c.replied, c.extra, c.closeAfter = false, c.extra[:0], true
-				c.JSON(code, errorBody(code))
-				break
-			}
-			s.dispatch(c)
-			c.start += used
-			c.scanned, c.need, c.sent100, c.wantContinue = 0, 0, false, false
-			if c.closeAfter {
-				break
-			}
-		}
+		s.answer(c)
 		if len(c.out) > 0 {
 			_, err := nc.Write(c.out)
 			c.out = c.out[:0]
@@ -167,25 +230,7 @@ func (s *Server) ServeConn(nc net.Conn) {
 		if c.closeAfter || last {
 			return
 		}
-		if c.wantContinue && !c.sent100 {
-			c.sent100 = true
-			if _, err := nc.Write(continue100); err != nil {
-				return
-			}
-		}
-		// Make room: drop consumed bytes, then grow if the pending request needs more than we have.
-		if c.start == c.end {
-			c.start, c.end = 0, 0
-			c.shrink()
-		} else if c.start > 0 {
-			c.end = copy(c.in, c.in[c.start:c.end])
-			c.start = 0
-		}
-		if !c.room() {
-			// A request that is still incomplete at the size limit (an endless chunked body, a
-			// flood of blank lines): refuse it and drop the connection.
-			c.replied, c.extra, c.closeAfter = false, c.extra[:0], true
-			c.JSON(413, errorBody(413))
+		if !c.settle() {
 			nc.Write(c.out)
 			return
 		}

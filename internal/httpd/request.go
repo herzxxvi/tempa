@@ -58,17 +58,25 @@ type Ctx struct {
 	// Connection buffers. in[start:end] holds bytes read but not yet consumed.
 	in           []byte
 	start, end   int
-	scanned      int // bytes of the pending request already searched for the end of the headers
-	need         int // total size of the pending request once its headers announced it; 0 = unknown
-	chunked      []byte
-	wantContinue bool // the pending request sent "Expect: 100-continue" and its body is incomplete
+	scanned      int    // bytes of the pending request already searched for the end of the headers
+	need         int    // total size of the pending request once its headers announced it; 0 = unknown
+	chunked      []byte // decoded chunked body, complete or (with chunkPos) in progress
+	chunkPos     int    // how far into the encoded body of the pending request decoding has come
+	wantContinue bool   // the pending request sent "Expect: 100-continue" and its body is incomplete
 	sent100      bool
+
+	// Used by the epoll loop only.
+	fd      int  // the connection's descriptor
+	written int  // bytes of out already sent
+	blocked bool // the socket would not take all of out: waiting for it to become writable
 }
 
 func (c *Ctx) resetConn() {
 	c.start, c.end, c.scanned, c.need = 0, 0, 0, 0
 	c.out = c.out[:0]
 	c.closeAfter, c.wantContinue, c.sent100, c.replied = false, false, false, false
+	c.written, c.blocked = 0, false
+	c.chunked, c.chunkPos = c.chunked[:0], 0
 }
 
 // grow makes the input buffer at least size bytes long, keeping what it holds. Small buffers
@@ -270,14 +278,17 @@ func (c *Ctx) parse(buf []byte) (used int, code int) {
 	c.Body = nil
 	switch {
 	case chunked:
-		body, n, code := dechunk(c.chunked[:0], buf[headEnd:])
-		c.chunked = body[:0]
+		// Decoding resumes where the previous attempt stopped, so a large upload that arrives in
+		// many reads is decoded once, not once per read.
+		body, n, code := dechunk(c.chunked, buf[headEnd:], c.chunkPos)
 		if code != 0 {
 			if code == needMore {
+				c.chunked, c.chunkPos = body, n
 				c.wantContinue = expect
 			}
 			return 0, code
 		}
+		c.chunked, c.chunkPos = body[:0], 0
 		c.Body = body
 		used += n
 	case length > 0:
@@ -339,17 +350,21 @@ func parseMethod(m []byte) Method {
 	return OTHER
 }
 
-// dechunk decodes a chunked body at the front of buf, appending the payload to dst. n is the number
-// of bytes of buf the encoded body occupies. code is 0, needMore or an HTTP error status.
-func dechunk(dst, buf []byte) (body []byte, n int, code int) {
-	pos := 0
+// dechunk decodes a chunked body at the front of buf, appending the payload to dst. It starts at
+// offset from, which must be a chunk boundary (0, or the n of an earlier call that needed more).
+// code is 0, needMore or an HTTP error status. With 0, n is the number of bytes of buf the encoded
+// body occupies; with needMore, n is the boundary up to which body holds the decoded payload, to be
+// passed back as from once more bytes have arrived.
+func dechunk(dst, buf []byte, from int) (body []byte, n int, code int) {
+	pos := from
 	for {
+		mark := pos
 		eol := bytes.Index(buf[pos:], crlf)
 		if eol < 0 {
 			if len(buf)-pos > 4096 {
 				return dst, 0, 400
 			}
-			return dst, 0, needMore
+			return dst, mark, needMore
 		}
 		line := buf[pos : pos+eol]
 		if semi := bytes.IndexByte(line, ';'); semi >= 0 {
@@ -376,7 +391,7 @@ func dechunk(dst, buf []byte) (body []byte, n int, code int) {
 					if len(buf)-pos > maxHeaderSize {
 						return dst, 0, 400
 					}
-					return dst, 0, needMore
+					return dst, mark, needMore
 				}
 				pos += eol + 2
 				if eol == 0 {
@@ -388,7 +403,7 @@ func dechunk(dst, buf []byte) (body []byte, n int, code int) {
 			return dst, 0, 413
 		}
 		if len(buf)-pos < size+2 {
-			return dst, 0, needMore
+			return dst, mark, needMore
 		}
 		dst = append(dst, buf[pos:pos+size]...)
 		pos += size
@@ -455,6 +470,6 @@ func hasToken(value []byte, token string) bool {
 // DecodeChunked decodes a complete chunked message body. ok is false while the body is incomplete
 // or when it is malformed.
 func DecodeChunked(buf []byte) (body []byte, ok bool) {
-	body, _, code := dechunk(nil, buf)
+	body, _, code := dechunk(nil, buf, 0)
 	return body, code == 0
 }

@@ -54,8 +54,23 @@ async function resolveEnvUrl(): Promise<string | undefined> {
 }
 
 // Runtime settings for the binary; anything already set in the environment wins. The binary applies
-// the same defaults itself, so these only document them where an operator looks first.
-const env: NodeJS.ProcessEnv = { GOMAXPROCS: '1', GOGC: 'off', GOMEMLIMIT: '256MiB', ...process.env };
+// the first three itself as well, so those only document them where an operator looks first.
+//
+// GODEBUG=schedtrace=<a very long interval> is not about tracing. Go's monitor thread goes into a
+// deep sleep whenever the program is idle, which a server with one worker is between any two
+// requests, and the next system call then has to wake it with a futex call, only for it to go back
+// to sleep moments later. That is two or three extra system calls and a thread wake-up per request,
+// which is costly where system calls are (a sandboxed kernel). With schedtrace set, the monitor
+// stays on its ordinary 10 ms tick and nobody has to wake it. The interval is 23 days, so no trace
+// line is ever printed. The runtime reads this before the program's own code runs, so it can only
+// be set here.
+const env: NodeJS.ProcessEnv = {
+  GOMAXPROCS: '1',
+  GOGC: 'off',
+  GOMEMLIMIT: '256MiB',
+  GODEBUG: 'schedtrace=2000000000',
+  ...process.env,
+};
 
 // Where to put an executable copy of the binary when the checkout's own file may not be executed
 // (a lost exec bit on a read-only mount, a mount that forbids execution, a policy that refuses it).

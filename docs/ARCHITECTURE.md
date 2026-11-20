@@ -17,7 +17,8 @@ section 10 building and testing.
 main.ts                 launcher: starts bin/forge-<platform>, passes its exit code on
 build.sh                builds bin/forge-linux-amd64 (committed, mode 100755) and the Windows build
 cmd/forge/              main.go (runtime tuning, wiring), lifecycle.go (register, /done polling)
-internal/httpd/         HTTP/1.1 engine: parser, response writer, router, auth check, test harness
+internal/httpd/         HTTP/1.1 engine: parser, response writer, router, auth check, the two
+                        socket I/O loops (netpoll, epoll), test harness
 internal/gitobj/        git object model: ids, encodings, object DB, trees, history, merge, diff
 internal/store/         the state and every domain operation (repos, refs, contents, issues, pulls)
 internal/render/        the one JSON renderer per REST object type
@@ -75,6 +76,17 @@ Runtime settings (`tune()` in `main.go`; each yields to the standard environment
 `main.ts` also sets): `GOMAXPROCS=1`, garbage collector off with a 256 MiB memory limit as backstop.
 One P because requests arrive one at a time on three of the four timed workloads and a second P only
 adds wake-ups; no GC because the hot paths do not allocate.
+
+`main.ts` sets one more variable, which only the launcher can set because the runtime reads it
+before the program starts: `GODEBUG=schedtrace=2000000000`. It has nothing to do with tracing. Go's
+monitor thread falls into a deep sleep whenever the program is idle (between any two requests, for
+a server with one P) and the next system call has to wake it with a futex call; with `schedtrace`
+set it stays on its ordinary 10 ms tick instead. Under a sandboxed kernel that removed 7,000 to
+10,000 futex calls per session and shortened the timed workloads by 1 to 6 %. The interval is 23 days,
+so nothing is ever printed. An operator's own `GODEBUG` wins.
+
+`FORGE_IO` chooses the socket I/O loop: `netpoll` (the default) or `epoll` (Linux; section 4.5).
+The first log line names the loop in use.
 
 Memory. A complete session (the 120 conformance checks and the four benchmark workloads) allocates
 about 21 MiB in total and obtains 27 to 31 MiB from the operating system; the collector never runs.
@@ -137,6 +149,8 @@ provides the check, `c.Auth()`.
   reply from cached bytes, about 0.4 us, 0 allocs).
 
 ### 4.2 The handler interface
+
+(The two socket I/O loops that sit underneath are in section 4.5; handlers cannot tell them apart.)
 
 ```go
 type Handler func(c *httpd.Ctx)
@@ -212,6 +226,45 @@ and writer without a socket and returns the response bytes. Use it for handler t
 (`internal/render/render_test.go`: `BenchmarkGetIssue` is the read workload's request end to end,
 0 allocs/op; `BenchmarkPostIssue` is the write workload's). Run benchmarks with
 `go test ./internal/<pkg>/ -run xxx -bench . -benchmem`.
+
+### 4.5 The two I/O loops
+
+Everything above the socket is one code path: `Server.answer` parses and answers every complete
+request in a connection's input buffer and appends the responses to its output buffer, and
+`Ctx.settle` prepares the buffer for the next read. The loops only move bytes.
+
+**netpoll** (`ServeConn` in `server.go`; every platform; the default). One goroutine per connection
+on Go's `net` package: read, answer, write, repeat. On a persistent connection one exchange costs
+about four and a half system calls: the read, the write, a second read that only learns there is
+nothing more (`EAGAIN`), and the runtime's own epoll polling.
+
+**epoll** (`reactor.go`, `reactor_linux.go`; Linux; `FORGE_IO=epoll`). All connections on one
+goroutine, driven by a level-triggered epoll instance through raw, non-blocking system calls. One
+exchange costs three system calls (wait, read, write), and when several connections are ready at
+once they share the wait.
+
+- Level-triggered readiness means a connection with unread bytes is reported again by the next
+  wait: reading once per event cannot strand a request.
+- A write the socket does not take in full leaves the rest in the output buffer; the connection is
+  then watched for writability instead of readability, so nothing more is read or buffered for it
+  until the client has taken what it was sent.
+- The listener is handled after the connections of a batch of events, so a descriptor number that
+  was closed and reused inside one batch cannot receive the old descriptor's event.
+- The wait is a raw `epoll_pwait` with a 5 ms timeout, which the Go scheduler does not see as
+  blocking: it never hands the P to another thread behind the loop's back, and the monitor thread
+  never goes into the deep sleep it must be woken from. With one P, other goroutines (the life
+  cycle's poll every two seconds) run when the loop yields, which it does on every timeout and
+  every 16 batches; their own network readiness is picked up by the monitor thread within about
+  10 ms. The loop is tuned for `GOMAXPROCS=1`.
+- If the loop cannot be set up, the server serves with netpoll.
+
+The connection state machine (`reactor.go`) contains no system calls: it talks to a four-method
+`kernel` interface, so `reactor_test.go` drives it on any platform with a scripted kernel (short
+writes, errors, closes, descriptor reuse, sixty connections fed and drained in arbitrary pieces,
+each checked byte for byte against the engine's own output). `reactor_linux_test.go` then runs the
+real loop on sockets: every engine test again on epoll, a 24 MiB response to a client that is not
+reading, 200 concurrent connections, connections ended in every way with a descriptor-leak check,
+a byte-at-a-time client, and the loop under `GOMAXPROCS=1`.
 
 ---
 

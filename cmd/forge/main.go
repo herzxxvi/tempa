@@ -49,13 +49,14 @@ func main() {
 		Handler:     forge.Serve,
 		Token:       token,
 		DefaultHost: "127.0.0.1:" + strconv.Itoa(port),
+		IO:          ioLoop(),
 	}
 	go func() {
 		err := srv.Serve(ln)
 		logf("server stopped: " + err.Error())
 		os.Exit(1)
 	}()
-	logf("listening on port " + strconv.Itoa(port))
+	logf("listening on port " + strconv.Itoa(port) + " (" + srv.IO + ")")
 
 	if !waitHealthy(port) {
 		logf("warning: /healthz did not answer on loopback; registering anyway")
@@ -104,6 +105,32 @@ func tune() {
 	if os.Getenv("GOMEMLIMIT") == "" {
 		debug.SetMemoryLimit(256 << 20)
 	}
+}
+
+// ioMode is the socket I/O loop used when FORGE_IO does not choose one. It can be set at link time
+// (-ldflags "-X main.ioMode=epoll"); empty means the netpoll loop.
+var ioMode string
+
+// ioLoop picks the socket I/O loop: FORGE_IO, else ioMode, else netpoll. "epoll" is the
+// single-threaded epoll loop of internal/httpd, available on Linux; anything that cannot be
+// honoured falls back to netpoll with one line of warning.
+func ioLoop() string {
+	want := os.Getenv("FORGE_IO")
+	if want == "" {
+		want = ioMode
+	}
+	switch want {
+	case "", httpd.IONetpoll:
+		return httpd.IONetpoll
+	case httpd.IOEpoll:
+		if httpd.EpollSupported {
+			return httpd.IOEpoll
+		}
+		logf("warning: the epoll loop is not available on this platform; using netpoll")
+	default:
+		logf("warning: unknown I/O loop " + strconv.Quote(want) + " (want netpoll or epoll); using netpoll")
+	}
+	return httpd.IONetpoll
 }
 
 func logf(line string) {
