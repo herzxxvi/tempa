@@ -22,6 +22,15 @@ const (
 	packRefDelta = 7
 )
 
+// Limits on what one pushed pack may make the server hold. Sizes in a pack are claims by the
+// client; nothing is allocated on a claim alone beyond growStep, and nothing at all beyond these.
+const (
+	maxObjectSize   = 32 << 20 // one object, inflated
+	maxPackInflated = 96 << 20 // all entries of one pack, inflated
+	growStep        = 1 << 20  // larger buffers grow with the data that actually arrives
+	keepInflateBuf  = 1 << 20  // an inflate buffer that grew beyond this is not kept
+)
+
 var (
 	errPackHeader   = errors.New("not a pack")
 	errPackVersion  = errors.New("unsupported pack version")
@@ -34,6 +43,7 @@ var (
 	errPackAdler    = errors.New("pack entry fails its zlib checksum")
 	errPackDelta    = errors.New("pack has a malformed delta")
 	errPackBase     = errors.New("pack has a delta whose base is missing")
+	errPackTooLarge = errors.New("pack holds an object or a total larger than this server accepts")
 )
 
 // unpacker reads pushed packs into an object database. One instance serves every push (the store
@@ -43,6 +53,8 @@ type unpacker struct {
 	fr  io.ReadCloser // raw deflate reader, reused through flate.Resetter
 	buf []byte        // inflated content of the entry being read
 	one [1]byte
+
+	inflated int // bytes inflated from the current pack so far
 
 	added   []*gitobj.Object // objects this pack added to the database
 	entries []packEntry      // every entry's offset and, once known, its object (OFS_DELTA bases)
@@ -74,23 +86,21 @@ func (u *unpacker) inflate(z []byte, size int) (content []byte, n int, err error
 	if len(z) < 6 || z[0]&0x0f != 8 || (uint(z[0])<<8|uint(z[1]))%31 != 0 || z[1]&0x20 != 0 {
 		return nil, 0, errPackZlib
 	}
-	// Deflate cannot expand beyond roughly 1032:1, so a larger claim is a lie; refuse it before
-	// allocating for it.
+	// Deflate cannot expand beyond roughly 1032:1, so a larger claim is a lie.
 	if size < 0 || size > len(z)*1100+64 {
 		return nil, 0, errPackSize
 	}
-	if cap(u.buf) < size {
-		u.buf = make([]byte, size+size/4+1024)
+	if u.inflated += size; size > maxObjectSize || u.inflated > maxPackInflated {
+		return nil, 0, errPackTooLarge
 	}
-	content = u.buf[:size]
 	u.br.Reset(z[2:])
 	if u.fr == nil {
 		u.fr = flate.NewReader(&u.br)
 	} else if err := u.fr.(flate.Resetter).Reset(&u.br, nil); err != nil {
 		return nil, 0, errPackZlib
 	}
-	if _, err := io.ReadFull(u.fr, content); err != nil {
-		return nil, 0, errPackSize
+	if content, err = u.read(size); err != nil {
+		return nil, 0, err
 	}
 	// One more read must find the end of the stream: more data means the declared size was short.
 	if got, err := u.fr.Read(u.one[:]); got != 0 || err != io.EOF {
@@ -106,11 +116,52 @@ func (u *unpacker) inflate(z []byte, size int) (content []byte, n int, err error
 	return content, end + 4, nil
 }
 
+// read inflates exactly size bytes from the current stream into the reused buffer. A size the
+// buffer already covers, or a small one, is read in one go. For a large one the buffer follows the
+// data, so an entry that claims more than its stream holds costs only what the stream inflates to.
+func (u *unpacker) read(size int) ([]byte, error) {
+	if size <= cap(u.buf) || size <= growStep {
+		if cap(u.buf) < size {
+			u.buf = make([]byte, size+size/4+1024)
+		}
+		content := u.buf[:size]
+		if _, err := io.ReadFull(u.fr, content); err != nil {
+			return nil, errPackSize
+		}
+		return content, nil
+	}
+	content := u.buf[:0]
+	for len(content) < size {
+		if len(content) == cap(content) {
+			grown := make([]byte, len(content), min(size, max(2*cap(content), growStep)))
+			copy(grown, content)
+			content = grown
+		}
+		n, err := u.fr.Read(content[len(content):cap(content)])
+		content = content[:len(content)+n]
+		if err != nil && len(content) < size {
+			return nil, errPackSize
+		}
+	}
+	u.buf = content
+	return content, nil
+}
+
 // unpack verifies a pack and stores its objects in db. Objects the database already has are left
 // alone. u.added lists what was new. On an error nothing useful has been stored and the caller
 // must call rollback.
 func (u *unpacker) unpack(db *gitobj.DB, pack []byte) error {
-	u.added, u.entries, u.pending = u.added[:0], u.entries[:0], u.pending[:0]
+	err := u.unpackEntries(db, pack)
+	if cap(u.buf) > keepInflateBuf {
+		u.buf = nil
+	}
+	clear(u.pending) // drop the references to delta data
+	u.pending = u.pending[:0]
+	return err
+}
+
+func (u *unpacker) unpackEntries(db *gitobj.DB, pack []byte) error {
+	u.added, u.entries, u.pending, u.inflated = u.added[:0], u.entries[:0], u.pending[:0], 0
 	if len(pack) < 12+sha1.Size || string(pack[:4]) != "PACK" {
 		return errPackHeader
 	}
@@ -278,10 +329,14 @@ func applyDelta(base, delta []byte) ([]byte, error) {
 		return nil, errPackDelta
 	}
 	size, delta, ok := deltaSize(delta)
-	if !ok || size > 1<<31 {
+	if !ok {
 		return nil, errPackDelta
 	}
-	out := make([]byte, 0, size)
+	if size > maxObjectSize {
+		return nil, errPackTooLarge
+	}
+	// The result size is a claim too: reserve a modest amount and let the instructions earn the rest.
+	out := make([]byte, 0, min(size, growStep))
 	for len(delta) > 0 {
 		op := delta[0]
 		delta = delta[1:]

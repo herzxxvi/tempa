@@ -5,8 +5,9 @@ surfaces over that store (REST v3, GraphQL v4, MCP, git smart HTTP). `main.ts` o
 binary. Everything is standard library; there is no git binary, no database and no file I/O at run
 time.
 
-Read sections 1 to 6 before you write code in any package. Section 7 is the store's API, the part
-every surface calls. Section 9 lists the rules each surface must keep.
+Sections 1 to 6 describe how the pieces fit together. Section 7 is the store's API, the part every
+surface calls. Section 8 covers rendering, section 9 the conventions every surface keeps, and
+section 10 building and testing.
 
 ---
 
@@ -32,10 +33,6 @@ Dependencies point one way: `app -> {rest, graphql, mcp, githttp} -> render -> s
 every surface uses `httpd`. `store` and `gitobj` know nothing about HTTP or JSON. A surface never
 imports another surface.
 
-Who owns what: `httpd`, `gitobj`, `store`, `render`, `app`, `githttp` and `cmd/forge` are the core's.
-`rest`, `graphql` and `mcp` each belong to their coder. If you need a change in a package that is
-not yours, ask for it; do not work around it inside your package.
-
 ---
 
 ## 2. Life cycle
@@ -48,18 +45,21 @@ SIGTERM and SIGINT, and exits with the binary's exit code. Two things make it mo
   The binary is static and resolves names with Go's own resolver; it tries `FORGE_ENV_URL` first and
   `MAKEFUN_ENV_URL` after it (and sticks with whichever answered), so neither resolver alone can
   cost the registration. An address, or a failed lookup, simply leaves `FORGE_ENV_URL` unset.
-- **Exec bit.** If the binary cannot be executed (`EACCES`), the launcher copies it to the temp
-  directory (then `/dev/shm`), sets mode 755 and starts the copy.
+- **Exec bit.** If the binary may not be executed (`EACCES` or `EPERM`: a lost exec bit, a mount or
+  a policy that forbids it), the launcher copies it to the temp directory (then `/dev/shm`), sets
+  mode 755 and starts the copy.
 
 Development only: `FORGE_BIN=<path>` runs another build, and where the platform's build is not in
-`bin/` (the Windows build is not committed, and the local grader runs a copy of the checkout made
-from git's file list) the launcher uses the copy `build.sh` keeps in `~/.cache/forge/`.
+`bin/` (only the Linux binary is committed, so a Windows workstation, or a copy of the checkout made
+from git's file list, has none) the launcher uses the copy `build.sh` keeps in `~/.cache/forge/`.
 
 The binary does everything else (`cmd/forge`):
 
 1. `MAKEFUN_ENV_URL` unset or not `http://...`: one line on stderr, exit 1.
 2. Listen on all interfaces, port chosen by the OS, never 8080 (`httpd.Listen`), start serving.
-3. Probe its own `/healthz` over loopback until it answers 200.
+3. Probe its own `/healthz` over loopback until it answers 200, for at most 1.5 s in total. The
+   probe is a courtesy (the listener is already bound, so the environment's own probes are accepted
+   either way); it can never delay the registration by more than that.
 4. `POST <env>/register {"port":N}`: 200 and 409 are success, 400 and 405 are fatal (exit 1),
    anything else is retried after 250 ms, doubling to 2 s.
 5. Poll `GET <env>/done` with the same backoff until the body says `{"done":true}`; exit 0.
@@ -68,12 +68,21 @@ The life cycle lives in the Go binary, not in `main.ts`, on purpose: there is no
 pipe, the Node process stays completely idle (it would otherwise run a `fetch` every two seconds on
 the machine the benchmark is timed on), and the client is 150 lines with tests against both response
 framings (`cmd/forge/lifecycle_test.go`). The process writes three lines to stderr in its whole life
-and nothing per request.
+(a fourth, a warning, if `MAKEFUN_SHOP_TOKEN` is empty) and nothing per request. The last line
+reports the memory the run used.
 
 Runtime settings (`tune()` in `main.go`; each yields to the standard environment variable, which
-`main.ts` also sets): `GOMAXPROCS=1`, garbage collector off with a 512 MiB memory limit as backstop.
+`main.ts` also sets): `GOMAXPROCS=1`, garbage collector off with a 256 MiB memory limit as backstop.
 One P because requests arrive one at a time on three of the four timed workloads and a second P only
 adds wake-ups; no GC because the hot paths do not allocate.
+
+Memory. A complete session (the 120 conformance checks and the four benchmark workloads) allocates
+about 21 MiB in total and obtains 27 to 31 MiB from the operating system; the collector never runs.
+What a single request can add is bounded: a request body is at most 32 MiB and is read into a
+buffer of exactly its size, which is released as soon as the request is answered; a pushed pack may
+inflate to at most 96 MiB in total and 32 MiB per object, and a size claimed in a pack header is
+never allocated in advance beyond 1 MiB. The 256 MiB limit sits above the worst single request and
+well below the memory of a small container.
 
 ---
 
@@ -116,8 +125,9 @@ provides the check, `c.Auth()`.
   deadlines and no request limits per connection.
 - Pipelining: every complete request in the input buffer is answered, in order, and all responses
   leave in **one write**. A normal request/response exchange is one read and one write.
-- `Content-Length` and chunked request bodies; `Expect: 100-continue`; bodies up to 256 MiB; a
-  request line plus headers up to 16 KiB (431 beyond).
+- `Content-Length` and chunked request bodies; `Expect: 100-continue`; bodies up to 32 MiB (413
+  beyond); a request line plus headers up to 16 KiB (431 beyond). The input buffer grows to exactly
+  the announced size of a large request and shrinks back once it is answered.
 - Every response carries `Content-Length` (except 204/304). Never chunked, never compressed, no
   `Date`, no `Server`.
 - A handler panic becomes `500 {"message":"Internal Server Error"}` with the stack on stderr; the
@@ -190,7 +200,7 @@ h := r.Find(c, c.Method, path)   // nil: no such route, or no handler for this m
   contents paths may arrive percent-encoded (`release%2F1.0`): use `c.ParamString(i)` for them.
   Repository names are `[A-Za-z0-9._-]` and need no decoding: pass `c.Param(i)` straight to
   `store.Lookup`.
-- A route that exists for another method only is `nil`, i.e. a 404, as the REST spec wants.
+- A route that exists for another method only is `nil`, which the REST surface answers with 404.
 - Registration panics on a malformed or duplicate pattern: that is a start-up bug, not a run-time
   condition.
 
@@ -227,8 +237,8 @@ must not hold the lock while they do.
 
 ### 5.2 Determinism
 
-Two runs fed the same requests must produce the same state, so that the replayed trial matches the
-live one. The rules, enforced in the store and expected from every surface:
+Two runs fed the same requests must produce the same state, so that a replay of a session is
+indistinguishable from the original. The rules, enforced in the store and expected from every surface:
 
 - **No wall clock in data.** The store has a logical clock: `Epoch` is 2026-01-01T00:00:00Z
   (1767225600) and every mutating operation advances it by one second (`Store.Tick`). `created_at`,
@@ -448,28 +458,28 @@ as they are (`json.RawMessage`); do not decode and re-encode them.
 
 ---
 
-## 9. Rules for every surface
+## 9. Conventions every surface keeps
 
-1. **Do not lock.** `app.Serve` holds the store mutex around your `Serve`.
-2. **Authenticate first**, before reading the body: `c.Auth()`. REST: 401 `Requires authentication`
-   (no header) / `Bad credentials` (wrong token), for every route including unknown ones. GraphQL
-   and MCP have their own 401 bodies (already in the stubs).
+1. **No locking.** `app.Serve` holds the store mutex around the surface's `Serve`.
+2. **Authentication first**, before the body is read: `c.Auth()`. REST: 401 `Requires authentication`
+   (no header) / `Bad credentials` (wrong token), for every route including unknown ones. GraphQL,
+   MCP and git have their own 401 replies.
 3. **One store operation per request**, then render. No business rule lives in a surface: if two
    surfaces need the same behaviour it belongs in the store.
-4. **Request bytes die with the request.** Anything you keep must be a copy (`string(b)`;
-   `encoding/json` copies into `string` fields by itself).
-5. **Reply exactly once**, through `httpd`. Never write to a socket, never start a goroutine, never
-   sleep, never log per request (each stderr line is a system call the benchmark pays for).
-6. **Never 500.** Check every lookup for nil and every parameter for `ok`; a panic is caught, but it
-   is a failed check.
+4. **Request bytes die with the request.** Anything kept is a copy (`string(b)`; `encoding/json`
+   copies into `string` fields by itself).
+5. **Exactly one reply**, through `httpd`. No surface writes to a socket, starts a goroutine, sleeps
+   or logs per request (each line on stderr is a system call).
+6. **No 500s.** Every lookup is checked for nil and every parameter for `ok`; the engine's panic
+   handler is a safety net, not a code path.
 7. **Deterministic output** (section 5.2): no `time.Now`, no ranging over maps for output, no
    random ids.
 8. **Standard library only**, and not `net/http`.
-9. **Hot paths do not allocate.** `GET .../issues/{n}` must stay at 0 allocs/op end to end and
-   `POST .../issues` at a handful (the stored strings, the issue, its rendered tail). On these two
-   routes: no `fmt`, no `strconv.Itoa`, no string concatenation, no `map[string]any`. Prove it with
-   a benchmark next to your tests.
-10. **Tests go through the real engine** (`httpd.NewTester`) so status, headers and body are checked
+9. **Hot paths do not allocate.** `GET .../issues/{n}` runs at 0 allocs/op end to end and
+   `POST .../issues` at a handful (the stored strings, the issue, its rendered tail): no `fmt`, no
+   `strconv.Itoa`, no string concatenation, no `map[string]any` on these routes. Benchmarks next to
+   the tests hold the line.
+10. **Tests go through the real engine** (`httpd.NewTester`), so status, headers and body are checked
     together.
 
 ### REST (`internal/rest`)
@@ -488,13 +498,13 @@ replaced); body field types and the issue-creation scanner in `decode.go`. Statu
 
 ### GraphQL (`internal/graphql`)
 
-`graphql.go` has the transport gate (POST only, 401 bodies). Resolve fields straight from the store
+`graphql.go` has the transport gate (POST only, 401 bodies). Fields resolve straight from the store
 objects (section 7 lists every field) and node ids through `Store.Node`; mutations call the same
 store operations REST calls (`CreateIssue`, `UpdateIssue` with state `closed`, `AddComment`,
 `CreatePull`, `MergePull` with method `squash` for `SQUASH`). `defaultBranchRef` is null exactly
 when `r.Head() == nil`. `mergeable` comes from `r.PullInfo(p).Mergeable`, `files` from
-`r.PullInfo(p).Files`. Timestamps: `render.AppendTime`. `encoding/json` is fine here (not timed), but
-keep response keys in selection order.
+`r.PullInfo(p).Files`. Timestamps: `render.AppendTime`. Response keys keep the order of the
+selection.
 
 ### MCP (`internal/mcp`)
 
@@ -503,8 +513,8 @@ call the store and embed the `render` bytes: `create_repo` -> `CreateRepo` + `Ap
 -> `Lookup` + `AppendRepo`, `create_issue` -> `CreateIssue` + `AppendIssue`, `list_issues` ->
 `ListIssues` + `AppendIssues`, `create_pull_request` -> `CreatePull` + `AppendPull`,
 `merge_pull_request` -> `MergePull` (method `squash`) + `AppendMergeResult`. Store errors become
-`isError: true` results with the `render.AppendError` text. Use `c.Host` for the renderers so the
-URLs match what REST returns to the same client.
+`isError: true` results with the `render.AppendError` text. The renderers get `c.Host`, so the URLs
+match what REST returns to the same client.
 
 ### Git (`internal/githttp`)
 
@@ -522,7 +532,9 @@ Files: `githttp.go` (routing, auth), `advert.go` (advertisements), `receive.go` 
 | `POST git-receive-pack` | always HTTP 200 with a report: `unpack ok` or `unpack <error>`, then `ok <ref>` / `ng <ref> <reason>` per update in request order, inside band 1 when the client asked for `side-band-64k` |
 
 Push rules. The pack is verified (trailer SHA-1, every zlib stream and its Adler-32, declared sizes,
-entry count), deltas are resolved against the pack or the store (thin packs), and every new
+entry count) within fixed limits (32 MiB per object and 96 MiB per pack once inflated; a declared
+size is only ever backed by memory as the data arrives), deltas are resolved against the pack or the
+store (thin packs), and every new
 object's references must exist, in the pack or already stored; otherwise the pack's objects are
 taken out again and the updates that needed them are refused with `missing necessary objects`.
 Updates are independent: create (`old` zero) needs the ref to be absent, update needs `old` to be
@@ -550,25 +562,29 @@ above. The surface calls `Store.Tick` once per push.
 
 Measured on the development machine (`go test ./internal/githttp/ -run xxx -bench . -benchmem`):
 one push of the push workload (advertisement GET + POST with a 3-object pack) 16 us, 0 allocs;
-one clone of the clone workload (5 requests) 3.1 us, 0 allocs. `TestRealGit` runs the git command
+one clone of the clone workload (5 requests) 2.4 us, 0 allocs. `TestRealGit` runs the git command
 line client against the surface (clone, shallow clone, deepen, unshallow, pull, delta pushes,
 refused pushes, protocol v0) wherever a git binary is installed.
 
 ---
 
-## 10. Building and grading
+## 10. Building and testing
 
 ```
 go vet ./... && go test ./...
-bash build.sh        # both binaries; stages bin/forge-linux-amd64 with the exec bit; no commit
+bash build.sh        # both binaries; stages bin/forge-linux-amd64 with the exec bit; commits nothing
 ```
-
-`build.sh` and `grade-local` must run while holding the shared lock described in the brief
-(`kompetisi8/.grade-lock`); compiling and testing your own package needs no lock. The local grader
-runs a copy of the checkout made from git's file list, so new files must at least be untracked and
-not ignored, and the Windows build is found through `~/.cache/forge/` (written by `build.sh`).
-A local grade needs a fresh process each time (it always gets one): repository names are fixed.
 
 `build.sh` builds with `CGO_ENABLED=0 -trimpath -buildvcs=false -tags netgo,osusergo
 -ldflags "-s -w -buildid="`: no libc, so the Linux binary is static (the script refuses a binary
-that names a dynamic loader) and byte-for-byte reproducible from the sources.
+that names a dynamic loader) and byte-for-byte reproducible from the sources. It also builds a
+Windows binary for workstations, which is not committed; `build.sh` keeps a copy of it in
+`~/.cache/forge/`, where `main.ts` looks when `bin/` has no build for the platform.
+
+The tests need nothing but Go. `TestRealGit` additionally drives the git command line client
+against the server when a git binary is installed, and is skipped otherwise (and with `-short`).
+Benchmarks for the request paths that matter most sit next to the tests:
+
+```
+go test ./internal/httpd/ ./internal/render/ ./internal/rest/ ./internal/githttp/ ./internal/gitobj/ -run xxx -bench . -benchmem
+```

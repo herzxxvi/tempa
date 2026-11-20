@@ -180,17 +180,32 @@ func parseResponse(buf []byte, eof bool) (status int, body []byte, ok bool) {
 	return status, rest, eof
 }
 
-// waitHealthy probes our own /healthz over loopback, so the environment's two probes right after
-// register cannot arrive before the server answers.
+// healthBudget bounds the loopback self-check in wall time. The check is a courtesy: the listener
+// is bound before it runs, so the environment's probes are accepted either way, while a register
+// that arrives late costs the whole trial. A stalled probe must never be what delays it.
+const (
+	healthBudget  = 1500 * time.Millisecond
+	healthAttempt = 250 * time.Millisecond
+)
+
+// waitHealthy probes our own /healthz over loopback until it answers 200 or healthBudget is spent.
 func waitHealthy(port int) bool {
-	self := endpoint{addr: net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), host: "127.0.0.1"}
-	for attempt := 0; attempt < 40; attempt++ {
-		if status, _, err := request(self, "GET", "/healthz", nil, 2*time.Second); err == nil && status == 200 {
+	return probeHealth(net.JoinHostPort("127.0.0.1", strconv.Itoa(port)), healthBudget)
+}
+
+func probeHealth(addr string, budget time.Duration) bool {
+	self := endpoint{addr: addr, host: "127.0.0.1"}
+	deadline := time.Now().Add(budget)
+	for {
+		left := time.Until(deadline)
+		if left <= 0 {
+			return false
+		}
+		if status, _, err := request(self, "GET", "/healthz", nil, min(healthAttempt, left)); err == nil && status == 200 {
 			return true
 		}
-		time.Sleep(25 * time.Millisecond)
+		time.Sleep(min(25*time.Millisecond, time.Until(deadline)))
 	}
-	return false
 }
 
 // register announces the port until the environment accepts it. 200 is the normal answer; 409 means

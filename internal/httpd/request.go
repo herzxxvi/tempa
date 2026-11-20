@@ -71,14 +71,50 @@ func (c *Ctx) resetConn() {
 	c.closeAfter, c.wantContinue, c.sent100, c.replied = false, false, false, false
 }
 
+// grow makes the input buffer at least size bytes long, keeping what it holds. Small buffers
+// double; a large one is sized to what is needed, so a body of n bytes costs n, not up to 2n.
 func (c *Ctx) grow(size int) {
 	n := len(c.in)
-	for n < size {
-		n *= 2
+	if size > growExact {
+		n = (size + 4095) &^ 4095
+	} else {
+		for n < size {
+			n *= 2
+		}
 	}
 	bigger := make([]byte, n)
 	copy(bigger, c.in[:c.end])
 	c.in = bigger
+}
+
+// room makes sure there is space to read more of the pending request: enough for the whole
+// request when its headers announced a length, otherwise up to twice the current buffer. It reports
+// false when the buffer is full at maxRequestSize, i.e. the request has outgrown what is accepted.
+func (c *Ctx) room() bool {
+	switch {
+	case c.need > len(c.in):
+		c.grow(c.need)
+	case c.end < len(c.in):
+	case len(c.in) >= maxRequestSize:
+		return false
+	default:
+		c.grow(min(2*len(c.in), maxRequestSize))
+	}
+	return true
+}
+
+// shrink replaces buffers that one large request left oversized. It runs only when no request is
+// pending, so nothing still points into them.
+func (c *Ctx) shrink() {
+	if len(c.in) > keepBuffer {
+		c.in = make([]byte, inputSize)
+	}
+	if cap(c.out) > keepBuffer {
+		c.out = make([]byte, 0, outputSize)
+	}
+	if cap(c.chunked) > keepBuffer {
+		c.chunked = nil
+	}
 }
 
 // Header returns the value of a request header, or nil. name must be lowercase.
@@ -94,6 +130,9 @@ func (c *Ctx) Header(name string) []byte {
 // needMore is parse's "the request is not complete yet" result.
 const needMore = -1
 
+// maxBlankLines is how many bytes of empty lines may precede a request line.
+const maxBlankLines = 64
+
 // parse decodes the request at the front of buf. It returns the number of bytes the request
 // occupies and 0, or needMore, or the HTTP status of the error reply to send before closing.
 func (c *Ctx) parse(buf []byte) (used int, code int) {
@@ -101,6 +140,9 @@ func (c *Ctx) parse(buf []byte) (used int, code int) {
 	skip := 0
 	for skip < len(buf) && (buf[skip] == '\r' || buf[skip] == '\n') {
 		skip++
+	}
+	if skip > maxBlankLines {
+		return 0, 400
 	}
 	from := max(skip, c.scanned-3)
 	i := bytes.Index(buf[from:], crlfcrlf)

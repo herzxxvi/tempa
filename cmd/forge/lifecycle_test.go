@@ -235,3 +235,38 @@ func TestEnvironmentFallback(t *testing.T) {
 		t.Error("a missing MAKEFUN_ENV_URL must stay an error")
 	}
 }
+
+// The self-check gives up within its budget whether the port refuses, stalls or answers wrongly.
+func TestProbeHealthIsBounded(t *testing.T) {
+	// A listener that accepts and then says nothing: the probe must not wait for it.
+	stalled, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stalled.Close()
+	go func() {
+		for {
+			conn, err := stalled.Accept()
+			if err != nil {
+				return
+			}
+			defer conn.Close()
+		}
+	}()
+	refused, _ := net.Listen("tcp", "127.0.0.1:0")
+	refusedAddr := refused.Addr().String()
+	refused.Close()
+	for name, addr := range map[string]string{"stalled": stalled.Addr().String(), "refused": refusedAddr} {
+		begin := time.Now()
+		if probeHealth(addr, 600*time.Millisecond) {
+			t.Errorf("%s: probe reported healthy", name)
+		}
+		if took := time.Since(begin); took < 550*time.Millisecond || took > 1200*time.Millisecond {
+			t.Errorf("%s: probe took %v with a 600 ms budget", name, took)
+		}
+	}
+	env := startEnv(t, false) // answers 404 to /healthz: reachable, but not healthy
+	if probeHealth(env.ln.Addr().String(), 300*time.Millisecond) {
+		t.Error("a 404 counted as healthy")
+	}
+}

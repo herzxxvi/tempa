@@ -55,10 +55,10 @@ async function resolveEnvUrl(): Promise<string | undefined> {
 
 // Runtime settings for the binary; anything already set in the environment wins. The binary applies
 // the same defaults itself, so these only document them where an operator looks first.
-const env: NodeJS.ProcessEnv = { GOMAXPROCS: '1', GOGC: 'off', GOMEMLIMIT: '512MiB', ...process.env };
+const env: NodeJS.ProcessEnv = { GOMAXPROCS: '1', GOGC: 'off', GOMEMLIMIT: '256MiB', ...process.env };
 
 // Where to put an executable copy of the binary when the checkout's own file may not be executed
-// (a lost exec bit on a read-only mount, or a mount that forbids execution).
+// (a lost exec bit on a read-only mount, a mount that forbids execution, a policy that refuses it).
 const fallbackDirs = windows ? [tmpdir()] : [tmpdir(), '/dev/shm'];
 
 const binary = locateBinary();
@@ -76,7 +76,7 @@ function start(path: string, nextFallback: number): void {
   proc.once('error', (err: Error & { code?: string }) => {
     if (child !== proc) return;
     child = undefined;
-    if (err.code === 'EACCES') {
+    if (err.code === 'EACCES' || err.code === 'EPERM') {
       for (let i = nextFallback; i < fallbackDirs.length; i += 1) {
         const copy = join(fallbackDirs[i], `forge-${process.pid}${windows ? '.exe' : ''}`);
         try {

@@ -28,13 +28,17 @@ import (
 // Prebuilt or Empty). Everything reachable from c is only valid until the handler returns.
 type Handler func(c *Ctx)
 
-// Limits. They are generous on purpose: refusing a valid request costs far more than a large buffer.
+// Limits. They are generous for the requests a forge sees (the largest are pushes) and still
+// bound what one request can make the server hold: nothing here grows on a client's say-so beyond
+// maxRequestSize, and a buffer that grew large is given back as soon as the request is answered.
 const (
-	inputSize     = 16 << 10  // initial input buffer per connection
-	outputSize    = 16 << 10  // initial output buffer per connection
-	maxHeaderSize = 16 << 10  // request line + headers
-	maxBodySize   = 256 << 20 // request body
-	keepBuffer    = 4 << 20   // buffers that grew beyond this are not kept for reuse
+	inputSize      = 16 << 10                                    // initial input buffer per connection
+	outputSize     = 16 << 10                                    // initial output buffer per connection
+	maxHeaderSize  = 16 << 10                                    // request line + headers
+	maxBodySize    = 32 << 20                                    // request body
+	maxRequestSize = maxBodySize + maxBodySize/8 + maxHeaderSize // on the wire; chunked framing included
+	growExact      = 1 << 20                                     // beyond this a buffer grows to the size needed, not to twice its size
+	keepBuffer     = 1 << 20                                     // a buffer that grew beyond this is replaced once it is empty again
 )
 
 // Server is the engine. Set Handler (and Token, for Ctx.Auth) before calling Serve.
@@ -129,12 +133,7 @@ func (s *Server) ServeConn(nc net.Conn) {
 	c.resetConn()
 	defer func() {
 		nc.Close()
-		if cap(c.in) > keepBuffer {
-			c.in = make([]byte, inputSize)
-		}
-		if cap(c.out) > keepBuffer {
-			c.out = make([]byte, 0, outputSize)
-		}
+		c.shrink()
 		s.pool.Put(c)
 	}()
 	last := false // the socket reported EOF or an error together with data: answer it, then stop
@@ -177,14 +176,18 @@ func (s *Server) ServeConn(nc net.Conn) {
 		// Make room: drop consumed bytes, then grow if the pending request needs more than we have.
 		if c.start == c.end {
 			c.start, c.end = 0, 0
+			c.shrink()
 		} else if c.start > 0 {
 			c.end = copy(c.in, c.in[c.start:c.end])
 			c.start = 0
 		}
-		if c.need > len(c.in) {
-			c.grow(c.need)
-		} else if c.end == len(c.in) {
-			c.grow(2 * len(c.in))
+		if !c.room() {
+			// A request that is still incomplete at the size limit (an endless chunked body, a
+			// flood of blank lines): refuse it and drop the connection.
+			c.replied, c.extra, c.closeAfter = false, c.extra[:0], true
+			c.JSON(413, errorBody(413))
+			nc.Write(c.out)
+			return
 		}
 		n, err := nc.Read(c.in[c.end:])
 		c.end += n

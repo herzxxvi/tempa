@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/hex"
 	"fmt"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -770,6 +771,70 @@ func TestPushBadPacks(t *testing.T) {
 	}
 	// And then the same push, complete, works.
 	f.mustPush("b", up, c1...)
+}
+
+// Sizes in a pack are claims. A pack that claims more than it holds, or more than the server
+// accepts, is refused without the server ever reserving memory for the claim.
+func TestPackSizeClaimsAreNotTrusted(t *testing.T) {
+	f := newForge(t)
+	r := f.create("limits")
+	up := []update{{zero, gitobj.OID{1}, "refs/heads/main"}}
+	refused := func(name string, pack []byte) {
+		t.Helper()
+		report := f.pushRaw("limits", pushBody(up, "report-status side-band-64k", pack))
+		if len(report) != 2 || !strings.HasPrefix(report[0], "unpack ") || report[0] == "unpack ok" || report[1] != "ng refs/heads/main unpacker error" {
+			t.Errorf("%s: %q", name, report)
+		}
+		if r.Objects.Len() != 0 {
+			t.Fatalf("%s: %d objects stored from a refused pack", name, r.Objects.Len())
+		}
+		if cap(f.git.up.buf) > keepInflateBuf {
+			t.Fatalf("%s: the inflate buffer was left at %d bytes", name, cap(f.git.up.buf))
+		}
+	}
+	// Enough trailing bytes for the compression-ratio test to let a 48 MiB claim through.
+	padding := make([]byte, 64<<10)
+	x := uint32(3)
+	for i := range padding {
+		x = x*1664525 + 1013904223
+		padding[i] = byte(x >> 24)
+	}
+	filler := append(entryHeader(3, len(padding)), deflate(padding)...)
+
+	// An entry that claims 48 MiB and holds five bytes.
+	lie := append(entryHeader(3, 48<<20), deflate([]byte("hello"))...)
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	refused("48 MiB claim, 5 bytes", finishPack(2, append(bytes.Clone(lie), filler...)))
+	runtime.ReadMemStats(&after)
+	if spent := after.TotalAlloc - before.TotalAlloc; spent > 8<<20 {
+		t.Fatalf("a false 48 MiB size claim made the server allocate %d bytes", spent)
+	}
+	// An entry that claims more than any object may be.
+	refused("object over the limit", finishPack(2, append(append(entryHeader(3, maxObjectSize+1), deflate([]byte("hello"))...), filler...)))
+	// A delta whose header promises a huge result.
+	huge := []byte{5, 0x80, 0x80, 0x80, 0x80, 0x10, 5, 'h', 'e', 'l', 'l', 'o'} // base 5 bytes, result 2^32
+	if _, err := applyDelta([]byte("hello"), huge); err != errPackTooLarge {
+		t.Errorf("delta with a 4 GiB result: %v", err)
+	}
+	promise := []byte{5, 0x80, 0x80, 0x80, 0x10, 5, 'h', 'e', 'l', 'l', 'o'} // result 32 MiB, 5 bytes of instructions
+	if out, err := applyDelta([]byte("hello"), promise); err != errPackDelta || cap(out) > growStep {
+		t.Errorf("delta with an unkept promise: %v, %d bytes reserved", err, cap(out))
+	}
+
+	// A genuinely large object still goes through, and the buffer it needed is given back.
+	large := bytes.Repeat([]byte("a line of text that compresses very well indeed\n"), 150000) // about 7 MiB
+	c := commitOf(1, map[string]string{"large.txt": string(large)})
+	f.mustPush("limits", []update{{zero, c[0].id, "refs/heads/main"}}, c...)
+	if got := r.Objects.Get(blob(string(large)).id); got == nil || !bytes.Equal(got.Data, large) {
+		t.Fatal("the large object was not stored intact")
+	}
+	if cap(f.git.up.buf) > keepInflateBuf {
+		t.Fatalf("the inflate buffer was kept at %d bytes", cap(f.git.up.buf))
+	}
+	if got := f.fetch("limits", []gitobj.OID{c[0].id}, nil, nil, 0); !got.has(c...) {
+		t.Fatal("clone of the large object is wrong")
+	}
 }
 
 // delta builds a git delta that turns base into target using one copy of their common prefix and

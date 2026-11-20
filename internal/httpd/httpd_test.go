@@ -506,3 +506,63 @@ func BenchmarkEngineGet(b *testing.B) {
 		c.scanned, c.need = 0, 0
 	}
 }
+
+// A large body costs its own size (not the next power of two), the buffer is given back once the
+// request is answered, and nothing makes the buffer grow past the request size limit.
+func TestBufferGrowthIsBounded(t *testing.T) {
+	sizes := make(chan [2]int, 4)
+	_, c := start(t, func(c *Ctx) {
+		sizes <- [2]int{len(c.Body), len(c.in)}
+		c.Empty(204)
+	})
+	const big = 3<<20 + 123
+	go c.send("POST /big HTTP/1.1\r\nHost: h\r\nContent-Length: " + strconv.Itoa(big) + "\r\n\r\n" + strings.Repeat("b", big))
+	c.read(true)
+	if got := <-sizes; got[0] != big || got[1] < big || got[1] > big+maxHeaderSize {
+		t.Fatalf("a %d byte body was read into a %d byte buffer", got[0], got[1])
+	}
+	c.send("POST /small HTTP/1.1\r\nHost: h\r\nContent-Length: 2\r\n\r\nok")
+	c.read(true)
+	if got := <-sizes; got[1] != inputSize {
+		t.Fatalf("after a large request the buffer is still %d bytes", got[1])
+	}
+
+	// The decision itself, at the limit.
+	ctx := &Ctx{in: make([]byte, inputSize)}
+	ctx.end = len(ctx.in)
+	if !ctx.room() || len(ctx.in) != 2*inputSize {
+		t.Fatalf("a full small buffer must double, got %d", len(ctx.in))
+	}
+	ctx.in = make([]byte, maxRequestSize-4096)
+	ctx.end = len(ctx.in)
+	if !ctx.room() || len(ctx.in) != maxRequestSize {
+		t.Fatalf("growth must stop at the request limit, got %d", len(ctx.in))
+	}
+	ctx.end = len(ctx.in)
+	if ctx.room() {
+		t.Fatal("a buffer full at the request limit must be refused")
+	}
+	ctx = &Ctx{in: make([]byte, inputSize), need: 5 << 20}
+	if !ctx.room() || len(ctx.in) < 5<<20 || len(ctx.in) > 5<<20+4096 {
+		t.Fatalf("an announced 5 MiB request got a %d byte buffer", len(ctx.in))
+	}
+
+	// Limits answered from the headers alone.
+	for raw, want := range map[string]int{
+		"POST / HTTP/1.1\r\nHost: h\r\nContent-Length: " + strconv.Itoa(maxBodySize+1) + "\r\n\r\n": 413,
+		strings.Repeat("\r\n", 400) + "GET / HTTP/1.1\r\nHost: h\r\n\r\n":                           400,
+	} {
+		_, c := start(t, echo)
+		c.send(raw)
+		if res := c.read(true); res.status != want {
+			t.Errorf("%q...: %d, want %d", raw[:20], res.status, want)
+		}
+		c.expectClosed()
+	}
+	// A couple of blank lines before a request are still fine.
+	_, c = start(t, echo)
+	c.send("\r\n\r\nGET /after-blank-lines HTTP/1.1\r\nHost: h\r\n\r\n")
+	if res := c.read(true); res.status != 200 || !strings.Contains(res.body, "/after-blank-lines") {
+		t.Fatalf("blank lines before a request: %d %s", res.status, res.body)
+	}
+}

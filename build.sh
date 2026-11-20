@@ -31,7 +31,7 @@ if [ "$size" -ge $((8 * 1024 * 1024)) ]; then
 fi
 
 # Development convenience, Windows workstations only: bin/*.exe is not committed, so a copy of the
-# checkout made from git's file list (the local grader makes one) has no Windows build in it.
+# checkout made from git's file list has no Windows build in it.
 # main.ts looks for it in the per-user cache directory in that case; keep that copy current.
 # (To run any other build: FORGE_BIN=/path/to/binary node main.ts)
 case "$(uname -s)" in
