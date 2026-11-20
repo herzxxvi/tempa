@@ -1,0 +1,753 @@
+# The forge's GraphQL schema: the part of GitHub's v4 schema that the forge has data for.
+#
+# This file is the single description of the type system. The package parses it at start-up;
+# validation, execution and introspection all work from the result, and every field of every object
+# type below must have a resolver in resolvers.go or the schema does not build.
+
+schema {
+  query: Query
+  mutation: Mutation
+}
+
+"Represents a unique identifier that is Base64 obfuscated. It appears in JSON as a string."
+scalar ID
+"Represents textual data as UTF-8 character sequences."
+scalar String
+"Represents non-fractional signed whole numeric values between -(2^31) and 2^31 - 1."
+scalar Int
+"Represents signed double-precision fractional values as specified by IEEE 754."
+scalar Float
+"Represents true or false values."
+scalar Boolean
+"An ISO-8601 encoded UTC date string."
+scalar DateTime
+"An RFC 3986, RFC 3987, and RFC 6570 (level 4) compliant URI string."
+scalar URI
+"A Git object ID."
+scalar GitObjectID
+
+"Directs the executor to include this field or fragment only when the if argument is true."
+directive @include("Included when true." if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"Directs the executor to skip this field or fragment when the if argument is true."
+directive @skip("Skipped when true." if: Boolean!) on FIELD | FRAGMENT_SPREAD | INLINE_FRAGMENT
+"Marks an element of a GraphQL schema as no longer supported."
+directive @deprecated(
+  "Explains why this element was deprecated."
+  reason: String = "No longer supported"
+) on FIELD_DEFINITION | ARGUMENT_DEFINITION | INPUT_FIELD_DEFINITION | ENUM_VALUE
+
+"The query root of the forge's GraphQL interface."
+type Query {
+  "The currently authenticated user."
+  viewer: User!
+  "Lookup a given repository by the owner and repository name."
+  repository(
+    "The login field of a user."
+    owner: String!
+    "The name of the repository."
+    name: String!
+    "Follow repository renames. The forge keeps no old names, so this changes nothing."
+    followRenames: Boolean = true
+  ): Repository
+  "Fetches an object given its ID."
+  node("ID of the object." id: ID!): Node
+  "Lookup nodes by a list of IDs."
+  nodes("The list of node IDs." ids: [ID!]!): [Node]!
+  "Lookup a user by login."
+  user("The user's login." login: String!): User
+  "Lookup a repository owner (the forge has one: the viewer) by login."
+  repositoryOwner("The username to lookup the owner by." login: String!): RepositoryOwner
+  "Perform a search across resources, returning at most 1,000 results."
+  search(
+    "The search string to look for."
+    query: String!
+    "The types of search items to search within."
+    type: SearchType!
+    first: Int
+    after: String
+    last: Int
+    before: String
+  ): SearchResultItemConnection!
+}
+
+"The root query for implementing GraphQL mutations."
+type Mutation {
+  "Creates a new issue."
+  createIssue(input: CreateIssueInput!): CreateIssuePayload
+  "Close an issue."
+  closeIssue(input: CloseIssueInput!): CloseIssuePayload
+  "Reopen an issue."
+  reopenIssue(input: ReopenIssueInput!): ReopenIssuePayload
+  "Adds a comment to an Issue or Pull Request."
+  addComment(input: AddCommentInput!): AddCommentPayload
+  "Create a new pull request."
+  createPullRequest(input: CreatePullRequestInput!): CreatePullRequestPayload
+  "Merge a pull request."
+  mergePullRequest(input: MergePullRequestInput!): MergePullRequestPayload
+  "Close a pull request."
+  closePullRequest(input: ClosePullRequestInput!): ClosePullRequestPayload
+}
+
+"An object with an ID."
+interface Node {
+  "ID of the object."
+  id: ID!
+}
+
+"Represents an object which can take actions on GitHub. Typically a User or Bot."
+interface Actor {
+  "The username of the actor."
+  login: String!
+  "A URL pointing to the actor's public avatar."
+  avatarUrl("The size of the resulting square image." size: Int): URI!
+  "The HTTP URL for this actor."
+  url: URI!
+}
+
+"Represents an owner of a Repository."
+interface RepositoryOwner {
+  id: ID!
+  "The username used to login."
+  login: String!
+  "A URL pointing to the owner's public avatar."
+  avatarUrl("The size of the resulting square image." size: Int): URI!
+  "The HTTP URL for the owner."
+  url: URI!
+}
+
+"A user is an individual's account that owns repositories and can make new content."
+type User implements Node & Actor & RepositoryOwner {
+  id: ID!
+  "Identifies the primary key from the database."
+  databaseId: Int
+  "The username used to login."
+  login: String!
+  "The user's public profile name."
+  name: String
+  "The user's publicly visible profile email."
+  email: String!
+  "A URL pointing to the user's public avatar."
+  avatarUrl("The size of the resulting square image." size: Int): URI!
+  "The HTTP URL for this user."
+  url: URI!
+}
+
+"A repository contains the content for a project."
+type Repository implements Node {
+  id: ID!
+  "Identifies the primary key from the database."
+  databaseId: Int
+  "The name of the repository."
+  name: String!
+  "The repository's name with owner."
+  nameWithOwner: String!
+  "The User owner of the repository."
+  owner: RepositoryOwner!
+  "The Ref associated with the repository's default branch; null while that branch has no commit."
+  defaultBranchRef: Ref
+  "The viewer's permission level on the repository."
+  viewerPermission: RepositoryPermission
+  "Indicates if the repository has issues feature enabled."
+  hasIssuesEnabled: Boolean!
+  "Returns a single issue from the current repository by number."
+  issue("The number for the issue to be returned." number: Int!): Issue
+  "A list of issues that have been opened in the repository."
+  issues(
+    first: Int
+    after: String
+    last: Int
+    before: String
+    "A list of states to filter the issues by."
+    states: [IssueState!]
+    "Ordering options for issues returned from the connection."
+    orderBy: IssueOrder
+    "A list of label names to filter the issues by."
+    labels: [String!]
+    "Filtering options for issues returned from the connection."
+    filterBy: IssueFilters
+  ): IssueConnection!
+  "Returns a single pull request from the current repository by number."
+  pullRequest("The number for the pull request to be returned." number: Int!): PullRequest
+  "A list of pull requests that have been opened in the repository."
+  pullRequests(
+    first: Int
+    after: String
+    last: Int
+    before: String
+    "A list of states to filter the pull requests by."
+    states: [PullRequestState!]
+    "Ordering options for pull requests returned from the connection."
+    orderBy: IssueOrder
+    "The head ref name to filter the pull requests by."
+    headRefName: String
+    "The base ref name to filter the pull requests by."
+    baseRefName: String
+    "A list of label names to filter the pull requests by."
+    labels: [String!]
+  ): PullRequestConnection!
+  "The description of the repository."
+  description: String
+  "The HTTP URL for this repository."
+  url: URI!
+  "Identifies if the repository is private or internal."
+  isPrivate: Boolean!
+  "Indicates the repository's visibility level."
+  visibility: RepositoryVisibility!
+  "Returns whether or not this repository is empty."
+  isEmpty: Boolean!
+  "Identifies if the repository is a fork."
+  isFork: Boolean!
+  "Indicates if the repository is unmaintained."
+  isArchived: Boolean!
+  "Identifies the date and time when the object was created."
+  createdAt: DateTime!
+  "Identifies the date and time when the object was last updated."
+  updatedAt: DateTime!
+  "Identifies the date and time when the repository was last pushed to."
+  pushedAt: DateTime
+  "Fetch a given ref from the repository."
+  ref("The ref to retrieve: a full name (refs/heads/main) or the name of a branch or tag." qualifiedName: String!): Ref
+  "Returns a single label by name."
+  label("Label name." name: String!): Label
+  "A list of labels associated with the repository."
+  labels(first: Int, after: String, last: Int, before: String): LabelConnection
+}
+
+"Represents a Git reference."
+type Ref implements Node {
+  id: ID!
+  "The ref name, without its prefix."
+  name: String!
+  "The ref's prefix, such as refs/heads/ or refs/tags/."
+  prefix: String!
+  "The commit the ref points to."
+  target: Commit
+}
+
+"Represents a Git commit."
+type Commit implements Node {
+  id: ID!
+  "The Git object ID."
+  oid: GitObjectID!
+  "The Git commit message."
+  message: String!
+}
+
+"An Issue is a place to discuss ideas, enhancements, tasks, and bugs for a project."
+type Issue implements Node {
+  id: ID!
+  "Identifies the issue number."
+  number: Int!
+  "Identifies the issue title."
+  title: String!
+  "Identifies the body of the issue."
+  body: String!
+  "Identifies the state of the issue."
+  state: IssueState!
+  "Identifies the primary key from the database."
+  databaseId: Int
+  "The HTTP URL for this issue."
+  url: URI!
+  "Indicates if the object is closed."
+  closed: Boolean!
+  "Identifies the date and time when the object was closed."
+  closedAt: DateTime
+  "Identifies the date and time when the object was created."
+  createdAt: DateTime!
+  "Identifies the date and time when the object was last updated."
+  updatedAt: DateTime!
+  "The actor who authored the issue."
+  author: Actor
+  "The repository associated with this node."
+  repository: Repository!
+  "Identifies the reason for the issue state."
+  stateReason: IssueStateReason
+  "A list of comments associated with the issue."
+  comments(first: Int, after: String, last: Int, before: String): IssueCommentConnection!
+  "A list of labels associated with the issue."
+  labels(first: Int, after: String, last: Int, before: String): LabelConnection
+}
+
+"A repository pull request."
+type PullRequest implements Node {
+  id: ID!
+  "Identifies the pull request number."
+  number: Int!
+  "Identifies the state of the pull request."
+  state: PullRequestState!
+  "Whether or not the pull request was merged."
+  merged: Boolean!
+  "Identifies the name of the head Ref associated with the pull request."
+  headRefName: String!
+  "Identifies the name of the base Ref associated with the pull request."
+  baseRefName: String!
+  "Whether or not the pull request can be merged based on the existence of merge conflicts."
+  mergeable: MergeableState!
+  "Lists the files changed within this pull request."
+  files(first: Int, after: String, last: Int, before: String): PullRequestChangedFileConnection
+  "Identifies the pull request title."
+  title: String!
+  "The body as Markdown."
+  body: String!
+  "The HTTP URL for this pull request."
+  url: URI!
+  "Identifies if the pull request is a draft."
+  isDraft: Boolean!
+  "Indicates if the object is closed, which a merged pull request is too."
+  closed: Boolean!
+  "The date and time that the pull request was merged."
+  mergedAt: DateTime
+  "Identifies the date and time when the object was created."
+  createdAt: DateTime!
+  "Identifies the date and time when the object was last updated."
+  updatedAt: DateTime!
+  "Identifies the date and time when the object was closed."
+  closedAt: DateTime
+  "The actor who authored the pull request."
+  author: Actor
+  "The repository associated with this node."
+  repository: Repository!
+  "Identifies the oid of the head ref associated with the pull request."
+  headRefOid: GitObjectID!
+  "Identifies the oid of the base ref associated with the pull request."
+  baseRefOid: GitObjectID!
+  "Identifies the head Ref associated with the pull request; null when the branch is gone."
+  headRef: Ref
+  "Identifies the base Ref associated with the pull request; null when the branch is gone."
+  baseRef: Ref
+  "The number of additions in this pull request."
+  additions: Int!
+  "The number of deletions in this pull request."
+  deletions: Int!
+  "The number of changed files in this pull request."
+  changedFiles: Int!
+  "Identifies the primary key from the database."
+  databaseId: Int
+  "A list of comments associated with the pull request."
+  comments(first: Int, after: String, last: Int, before: String): IssueCommentConnection!
+}
+
+"A file changed in a pull request."
+type PullRequestChangedFile {
+  "The path of the file."
+  path: String!
+  "The number of additions to the file."
+  additions: Int!
+  "The number of deletions to the file."
+  deletions: Int!
+  "How the file was changed in this pull request."
+  changeType: PatchStatus!
+}
+
+"Represents a comment on an Issue or a Pull Request."
+type IssueComment implements Node {
+  id: ID!
+  "Identifies the primary key from the database."
+  databaseId: Int
+  "The body as Markdown."
+  body: String!
+  "The actor who authored the comment."
+  author: Actor
+  "Identifies the date and time when the object was created."
+  createdAt: DateTime!
+  "The HTTP URL for this issue comment."
+  url: URI!
+}
+
+"A label for categorizing Issues and Pull Requests within a repository."
+type Label implements Node {
+  id: ID!
+  "Identifies the label name."
+  name: String!
+  "Identifies the label color."
+  color: String!
+  "A brief description of this label."
+  description: String
+}
+
+"Information about pagination in a connection."
+type PageInfo {
+  "When paginating forwards, are there more items?"
+  hasNextPage: Boolean!
+  "When paginating backwards, are there more items?"
+  hasPreviousPage: Boolean!
+  "When paginating backwards, the cursor to continue."
+  startCursor: String
+  "When paginating forwards, the cursor to continue."
+  endCursor: String
+}
+
+"The connection type for Issue."
+type IssueConnection {
+  "A list of edges."
+  edges: [IssueEdge]
+  "A list of nodes."
+  nodes: [Issue]
+  "Information to aid in pagination."
+  pageInfo: PageInfo!
+  "Identifies the total count of items in the connection."
+  totalCount: Int!
+}
+
+"An edge in a connection."
+type IssueEdge {
+  "A cursor for use in pagination."
+  cursor: String!
+  "The item at the end of the edge."
+  node: Issue
+}
+
+"The connection type for PullRequest."
+type PullRequestConnection {
+  edges: [PullRequestEdge]
+  nodes: [PullRequest]
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+"An edge in a connection."
+type PullRequestEdge {
+  cursor: String!
+  node: PullRequest
+}
+
+"The connection type for PullRequestChangedFile."
+type PullRequestChangedFileConnection {
+  edges: [PullRequestChangedFileEdge]
+  nodes: [PullRequestChangedFile]
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+"An edge in a connection."
+type PullRequestChangedFileEdge {
+  cursor: String!
+  node: PullRequestChangedFile
+}
+
+"The connection type for IssueComment."
+type IssueCommentConnection {
+  edges: [IssueCommentEdge]
+  nodes: [IssueComment]
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+"An edge in a connection."
+type IssueCommentEdge {
+  cursor: String!
+  node: IssueComment
+}
+
+"The connection type for Label."
+type LabelConnection {
+  edges: [LabelEdge]
+  nodes: [Label]
+  pageInfo: PageInfo!
+  totalCount: Int!
+}
+
+"An edge in a connection."
+type LabelEdge {
+  cursor: String!
+  node: Label
+}
+
+"The results of a search."
+union SearchResultItem = Issue | PullRequest | Repository | User
+
+"A list of results that matched against a search query."
+type SearchResultItemConnection {
+  "The total number of issues and pull requests that matched the search query."
+  issueCount: Int!
+  "The total number of repositories that matched the search query."
+  repositoryCount: Int!
+  "The total number of users that matched the search query."
+  userCount: Int!
+  edges: [SearchResultItemEdge]
+  nodes: [SearchResultItem]
+  pageInfo: PageInfo!
+}
+
+"An edge in a connection."
+type SearchResultItemEdge {
+  cursor: String!
+  node: SearchResultItem
+}
+
+"The possible states of an issue."
+enum IssueState {
+  "An issue that is still open."
+  OPEN
+  "An issue that has been closed."
+  CLOSED
+}
+
+"The possible state reasons of an issue."
+enum IssueStateReason {
+  COMPLETED
+  NOT_PLANNED
+  REOPENED
+}
+
+"The possible state reasons of a closed issue."
+enum IssueClosedStateReason {
+  "An issue that has been closed as completed."
+  COMPLETED
+  "An issue that has been closed as not planned."
+  NOT_PLANNED
+}
+
+"The possible states of a pull request."
+enum PullRequestState {
+  "A pull request that is still open."
+  OPEN
+  "A pull request that has been closed without being merged."
+  CLOSED
+  "A pull request that has been closed by being merged."
+  MERGED
+}
+
+"Whether or not a PullRequest can be merged."
+enum MergeableState {
+  "The pull request can be merged."
+  MERGEABLE
+  "The pull request cannot be merged due to merge conflicts."
+  CONFLICTING
+  "The mergeability of the pull request is not known: it is closed or merged, or a branch is gone."
+  UNKNOWN
+}
+
+"Represents available types of methods to use when merging a pull request."
+enum PullRequestMergeMethod {
+  "Add all commits from the head branch to the base branch with a merge commit."
+  MERGE
+  "Combine all commits from the head branch into a single commit in the base branch."
+  SQUASH
+  "Add the changes of the head branch onto the base branch as one new commit."
+  REBASE
+}
+
+"The access level to a repository."
+enum RepositoryPermission {
+  ADMIN
+  MAINTAIN
+  WRITE
+  TRIAGE
+  READ
+}
+
+"Represents the individual results of a search."
+enum SearchType {
+  "Returns results matching issues in repositories."
+  ISSUE
+  "Returns results matching issues in repositories, with the same query syntax as ISSUE."
+  ISSUE_ADVANCED
+  "Returns results matching repositories."
+  REPOSITORY
+  "Returns results matching users."
+  USER
+  "Returns matching discussions in repositories. The forge has none."
+  DISCUSSION
+}
+
+"Properties by which issue connections can be ordered."
+enum IssueOrderField {
+  "Order issues by creation time."
+  CREATED_AT
+  "Order issues by update time."
+  UPDATED_AT
+  "Order issues by comment count."
+  COMMENTS
+}
+
+"Possible directions in which to order a list of items when provided an orderBy argument."
+enum OrderDirection {
+  "Specifies an ascending order for a given orderBy argument."
+  ASC
+  "Specifies a descending order for a given orderBy argument."
+  DESC
+}
+
+"The repository's visibility level."
+enum RepositoryVisibility {
+  PRIVATE
+  PUBLIC
+  INTERNAL
+}
+
+"The possible types of patch statuses."
+enum PatchStatus {
+  ADDED
+  DELETED
+  RENAMED
+  COPIED
+  MODIFIED
+  CHANGED
+}
+
+"Ways in which lists of issues can be ordered upon return."
+input IssueOrder {
+  "The field in which to order issues by."
+  field: IssueOrderField!
+  "The direction in which to order issues by the specified field."
+  direction: OrderDirection!
+}
+
+"Ways in which to filter lists of issues."
+input IssueFilters {
+  "List issues that have been updated at or after the given date."
+  since: DateTime
+  "List issues where the list of label names exist on the issue."
+  labels: [String!]
+  "List issues filtered by the list of states given."
+  states: [IssueState!]
+  "List issues created by given name."
+  createdBy: String
+  "List issues assigned to given name. The forge assigns nobody, so any name matches no issue."
+  assignee: String
+  "List issues where the given name is mentioned in the issue."
+  mentioned: String
+}
+
+"Autogenerated input type of CreateIssue"
+input CreateIssueInput {
+  "The Node ID of the repository."
+  repositoryId: ID!
+  "The title for the issue."
+  title: String!
+  "The body for the issue description."
+  body: String
+  "The Node ID of assignees for this issue. Accepted and ignored: the forge assigns nobody."
+  assigneeIds: [ID!]
+  "An array of Node IDs of labels for this issue."
+  labelIds: [ID!]
+  "The Node ID of the milestone for this issue. Accepted and ignored."
+  milestoneId: ID
+  "An array of Node IDs for projects associated with this issue. Accepted and ignored."
+  projectIds: [ID!]
+  "A unique identifier for the client performing the mutation."
+  clientMutationId: String
+}
+
+"Autogenerated input type of CloseIssue"
+input CloseIssueInput {
+  "ID of the issue to be closed."
+  issueId: ID!
+  "The reason the issue is to be closed."
+  stateReason: IssueClosedStateReason
+  clientMutationId: String
+}
+
+"Autogenerated input type of ReopenIssue"
+input ReopenIssueInput {
+  "ID of the issue to be opened."
+  issueId: ID!
+  clientMutationId: String
+}
+
+"Autogenerated input type of AddComment"
+input AddCommentInput {
+  "The Node ID of the subject to modify: an issue or a pull request."
+  subjectId: ID!
+  "The contents of the comment."
+  body: String!
+  clientMutationId: String
+}
+
+"Autogenerated input type of CreatePullRequest"
+input CreatePullRequestInput {
+  "The Node ID of the repository."
+  repositoryId: ID!
+  "The name of the branch you want your changes pulled into."
+  baseRefName: String!
+  "The name of the branch where your changes are implemented."
+  headRefName: String!
+  "The Node ID of the head repository. Accepted and ignored: the forge has no forks."
+  headRepositoryId: ID
+  "The title of the pull request."
+  title: String!
+  "The contents of the pull request."
+  body: String
+  "Indicates whether this pull request should be a draft."
+  draft: Boolean = false
+  "Indicates whether maintainers can modify the pull request. Accepted and ignored."
+  maintainerCanModify: Boolean = true
+  clientMutationId: String
+}
+
+"Autogenerated input type of MergePullRequest"
+input MergePullRequestInput {
+  "ID of the pull request to be merged."
+  pullRequestId: ID!
+  "The merge method to use."
+  mergeMethod: PullRequestMergeMethod = MERGE
+  "Commit headline to use for the merge commit; if omitted, a default message will be used."
+  commitHeadline: String
+  "Commit body to use for the merge commit; if omitted, a default message will be used."
+  commitBody: String
+  "OID that the pull request head ref must match to allow merge; if omitted, no check is performed."
+  expectedHeadOid: GitObjectID
+  "The email address to associate with this merge. Accepted and ignored."
+  authorEmail: String
+  clientMutationId: String
+}
+
+"Autogenerated input type of ClosePullRequest"
+input ClosePullRequestInput {
+  "ID of the pull request to be closed."
+  pullRequestId: ID!
+  clientMutationId: String
+}
+
+"Autogenerated return type of CreateIssue."
+type CreateIssuePayload {
+  "A unique identifier for the client performing the mutation."
+  clientMutationId: String
+  "The new issue."
+  issue: Issue
+}
+
+"Autogenerated return type of CloseIssue."
+type CloseIssuePayload {
+  clientMutationId: String
+  "The issue that was closed."
+  issue: Issue
+}
+
+"Autogenerated return type of ReopenIssue."
+type ReopenIssuePayload {
+  clientMutationId: String
+  "The issue that was opened."
+  issue: Issue
+}
+
+"Autogenerated return type of AddComment."
+type AddCommentPayload {
+  clientMutationId: String
+  "The edge from the subject's comment connection."
+  commentEdge: IssueCommentEdge
+  "The subject."
+  subject: Node
+}
+
+"Autogenerated return type of CreatePullRequest."
+type CreatePullRequestPayload {
+  clientMutationId: String
+  "The new pull request."
+  pullRequest: PullRequest
+}
+
+"Autogenerated return type of MergePullRequest."
+type MergePullRequestPayload {
+  clientMutationId: String
+  "The pull request that was merged."
+  pullRequest: PullRequest
+}
+
+"Autogenerated return type of ClosePullRequest."
+type ClosePullRequestPayload {
+  clientMutationId: String
+  "The pull request that was closed."
+  pullRequest: PullRequest
+}

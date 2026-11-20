@@ -20,6 +20,16 @@ import (
 
 const hexUpper = "0123456789ABCDEF"
 
+// plainASCII[ch] is true for the ASCII bytes a JSON string holds unescaped: everything from the
+// space up except the quote and the backslash. Text is almost entirely such bytes, so AppendString
+// tests one table entry per byte and only looks closer at the rest.
+var plainASCII = func() (t [256]bool) {
+	for ch := 0x20; ch < utf8.RuneSelf; ch++ {
+		t[ch] = ch != '"' && ch != '\\'
+	}
+	return t
+}()
+
 // AppendString appends s as a JSON string. It escapes the quote, the backslash and control
 // characters, replaces invalid UTF-8 with U+FFFD and passes everything else through unchanged; in
 // particular '<', '>' and '&' are not escaped, so text round-trips byte for byte.
@@ -28,11 +38,11 @@ func AppendString(dst []byte, s string) []byte {
 	start := 0
 	for i := 0; i < len(s); {
 		ch := s[i]
+		if plainASCII[ch] {
+			i++
+			continue
+		}
 		if ch < utf8.RuneSelf {
-			if ch >= 0x20 && ch != '"' && ch != '\\' {
-				i++
-				continue
-			}
 			dst = append(dst, s[start:i]...)
 			switch ch {
 			case '"':

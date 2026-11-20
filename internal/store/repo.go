@@ -16,8 +16,8 @@ type Ref struct {
 // surface fills it lazily; every ref change empties it (see refsChanged). Entries are keyed by this
 // repository object, never by name, so a deleted and recreated repository cannot see stale bytes.
 type GitCache struct {
-	AdvReceive  []byte            // receive-pack advertisement
-	AdvUploadV0 []byte            // protocol v0 upload-pack advertisement
+	AdvReceive  []byte            // receive-pack advertisement; empty = not rendered for this Gen
+	AdvUploadV0 []byte            // protocol v0 upload-pack advertisement; empty = not rendered
 	Upload      map[string][]byte // upload-pack request body -> response
 }
 
@@ -138,7 +138,8 @@ func (r *Repo) Head() *gitobj.Object {
 // against the old ref state.
 func (r *Repo) refsChanged() {
 	r.Gen++
-	r.Git.AdvReceive, r.Git.AdvUploadV0 = nil, nil
+	// Truncate rather than drop, so the next advertisement is rendered into the same memory.
+	r.Git.AdvReceive, r.Git.AdvUploadV0 = r.Git.AdvReceive[:0], r.Git.AdvUploadV0[:0]
 	clear(r.Git.Upload)
 	r.PushedAt = r.store.clock
 }

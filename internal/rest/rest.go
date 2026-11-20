@@ -29,12 +29,62 @@ func New(st *store.Store) *API {
 }
 
 // routes registers every REST route. Patterns are relative to /api/v3; see httpd.Router for the
-// syntax. Parameters are read by position with c.Param(i).
+// syntax. Parameters are read by position with c.Param(i): in every repository route 0 is the owner
+// and 1 the repository.
 func (a *API) routes() {
 	r := &a.router
 	r.Handle(httpd.GET, "/", a.getRoot)
 	r.Handle(httpd.GET, "/meta", a.getMeta)
 	r.Handle(httpd.GET, "/user", a.getUser)
+	r.Handle(httpd.GET, "/user/repos", a.listRepos)
+	r.Handle(httpd.POST, "/user/repos", a.createRepo)
+	r.Handle(httpd.GET, "/users/{user}", a.getUserByLogin)
+	r.Handle(httpd.GET, "/users/{user}/repos", a.listUserRepos)
+
+	const repo = "/repos/{owner}/{repo}"
+	r.Handle(httpd.GET, repo, a.getRepo)
+	r.Handle(httpd.PATCH, repo, a.patchRepo)
+	r.Handle(httpd.DELETE, repo, a.deleteRepo)
+
+	r.Handle(httpd.GET, repo+"/branches", a.listBranches)
+	r.Handle(httpd.GET, repo+"/branches/{branch...}", a.getBranch)
+	r.Handle(httpd.GET, repo+"/git/refs", a.listRefs)
+	r.Handle(httpd.POST, repo+"/git/refs", a.createRef)
+	r.Handle(httpd.GET, repo+"/git/refs/{ref...}", a.getRefs)
+	r.Handle(httpd.PATCH, repo+"/git/refs/{ref...}", a.patchRef)
+	r.Handle(httpd.DELETE, repo+"/git/refs/{ref...}", a.deleteRef)
+	r.Handle(httpd.GET, repo+"/git/ref/{ref...}", a.getRef)
+	r.Handle(httpd.GET, repo+"/git/matching-refs/{ref...}", a.matchRefs)
+	r.Handle(httpd.GET, repo+"/commits", a.listCommits)
+	r.Handle(httpd.GET, repo+"/commits/{ref...}", a.getCommit)
+
+	r.Handle(httpd.GET, repo+"/contents", a.getContents)
+	r.Handle(httpd.GET, repo+"/contents/{path...}", a.getContents)
+	r.Handle(httpd.PUT, repo+"/contents/{path...}", a.putContents)
+	r.Handle(httpd.DELETE, repo+"/contents/{path...}", a.deleteContents)
+
+	r.Handle(httpd.GET, repo+"/labels", a.listLabels)
+	r.Handle(httpd.POST, repo+"/labels", a.createLabel)
+	r.Handle(httpd.GET, repo+"/labels/{name}", a.getLabel)
+	r.Handle(httpd.PATCH, repo+"/labels/{name}", a.patchLabel)
+	r.Handle(httpd.DELETE, repo+"/labels/{name}", a.deleteLabel)
+
+	r.Handle(httpd.GET, repo+"/issues", a.listIssues)
+	r.Handle(httpd.POST, repo+"/issues", a.createIssue)
+	r.Handle(httpd.GET, repo+"/issues/{number}", a.getIssue)
+	r.Handle(httpd.PATCH, repo+"/issues/{number}", a.patchIssue)
+	r.Handle(httpd.GET, repo+"/issues/{number}/labels", a.listIssueLabels)
+	r.Handle(httpd.GET, repo+"/issues/{number}/comments", a.listComments)
+	r.Handle(httpd.POST, repo+"/issues/{number}/comments", a.createComment)
+	r.Handle(httpd.GET, repo+"/issues/comments/{id}", a.getComment)
+
+	r.Handle(httpd.GET, repo+"/pulls", a.listPulls)
+	r.Handle(httpd.POST, repo+"/pulls", a.createPull)
+	r.Handle(httpd.GET, repo+"/pulls/{number}", a.getPull)
+	r.Handle(httpd.PATCH, repo+"/pulls/{number}", a.patchPull)
+	r.Handle(httpd.GET, repo+"/pulls/{number}/files", a.listPullFiles)
+	r.Handle(httpd.GET, repo+"/pulls/{number}/merge", a.getPullMerge)
+	r.Handle(httpd.PUT, repo+"/pulls/{number}/merge", a.mergePull)
 }
 
 // The fixed replies. Every REST error body is a JSON object with a non-empty "message".
@@ -62,11 +112,16 @@ func (a *API) Serve(c *httpd.Ctx, sub []byte) {
 		c.JSON(401, badCredentials)
 		return
 	}
-	if h := a.router.Find(c, c.Method, sub); h != nil {
-		h(c)
+	h := a.router.Find(c, c.Method, sub)
+	if h == nil && c.Method == httpd.HEAD {
+		// HEAD is GET without the body; the engine leaves the body out of the reply.
+		h = a.router.Find(c, httpd.GET, sub)
+	}
+	if h == nil {
+		c.JSON(404, notFound)
 		return
 	}
-	c.JSON(404, notFound)
+	h(c)
 }
 
 // NotFound replies 404 {"message":"Not Found",...}.
@@ -97,14 +152,35 @@ func (a *API) Repo(c *httpd.Ctx, i int) *store.Repo {
 	return r
 }
 
+// Message replies with a bare {"message": ...} body, for the few failures that are the surface's own
+// (an undecodable parameter) rather than the store's.
+func Message(c *httpd.Ctx, status int, message string) {
+	c.Scratch = render.AppendMessage(c.Scratch[:0], message)
+	c.JSON(status, c.Scratch)
+}
+
+// skipSpace returns b without its leading JSON whitespace.
+func skipSpace(b []byte) []byte {
+	for len(b) > 0 && (b[0] == ' ' || b[0] == '\t' || b[0] == '\r' || b[0] == '\n') {
+		b = b[1:]
+	}
+	return b
+}
+
+// DecodeOptional is Decode for routes whose body may be left out entirely (merge, contents delete
+// with query parameters): an empty body leaves v untouched and succeeds.
+func DecodeOptional(c *httpd.Ctx, v any) bool {
+	if len(skipSpace(c.Body)) == 0 {
+		return true
+	}
+	return Decode(c, v)
+}
+
 // Decode parses the request body, which must be a JSON object, into v. On failure it replies 400
 // "Problems parsing JSON" (malformed JSON, an empty body, or a value that is not an object) or 422
 // (a field of the wrong JSON type) and returns false.
 func Decode(c *httpd.Ctx, v any) bool {
-	body := c.Body
-	for len(body) > 0 && (body[0] == ' ' || body[0] == '\t' || body[0] == '\r' || body[0] == '\n') {
-		body = body[1:]
-	}
+	body := skipSpace(c.Body)
 	if len(body) == 0 || body[0] != '{' {
 		c.JSON(400, badJSON)
 		return false

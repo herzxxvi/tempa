@@ -255,3 +255,10 @@ func (db *DB) Peel(id OID) *Object {
 	}
 	return nil
 }
+
+// Remove forgets an object. It exists for one purpose: taking back the objects of a pushed pack
+// that turned out to reference objects the repository does not have. The object's bytes stay in
+// the arena.
+func (db *DB) Remove(id OID) {
+	delete(db.objs, id)
+}

@@ -2,35 +2,67 @@
 //
 // The forge itself is one static Go binary (sources under cmd/ and internal/, built by build.sh).
 // It binds its own port, registers with the environment named by MAKEFUN_ENV_URL, serves until the
-// environment says the trial is over and exits 0. This file only starts the right binary for the
-// platform and passes its exit code on, so `node main.ts` behaves exactly like the binary.
+// environment says the trial is over and exits 0. This file starts that binary and passes its exit
+// code on, so `node main.ts` behaves exactly like the binary.
 
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
+import { lookup } from 'node:dns/promises';
 import { chmodSync, copyFileSync, existsSync } from 'node:fs';
+import { isIP } from 'node:net';
 import { constants, homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const windows = process.platform === 'win32';
-const name = windows ? 'forge-windows-amd64.exe' : 'forge-linux-amd64';
-const bundled = join(dirname(fileURLToPath(import.meta.url)), 'bin', name);
 
-// The Linux binary is committed and always sits next to this file. The Windows build is a
-// workstation convenience that is not committed, so a copy of the checkout made from git's file
-// list (the local grader makes one) arrives without it; build.sh therefore also leaves the Windows
-// build in the user's cache directory, and that copy is used when the bundled one is absent.
-const binary = windows && !existsSync(bundled) ? join(homedir(), '.cache', 'forge', name) : bundled;
+/**
+ * The binary to run: the Linux build committed in bin/ next to this file.
+ *
+ * Development only: FORGE_BIN names another build to run instead, and a platform whose build is not
+ * part of the checkout (bin/ holds only the committed Linux binary) uses the copy build.sh keeps in
+ * the per-user cache directory.
+ */
+function locateBinary(): string {
+  if (process.env.FORGE_BIN) return process.env.FORGE_BIN;
+  const name = windows ? 'forge-windows-amd64.exe' : 'forge-linux-amd64';
+  const bundled = join(dirname(fileURLToPath(import.meta.url)), 'bin', name);
+  return existsSync(bundled) ? bundled : join(homedir(), '.cache', 'forge', name);
+}
+
+/**
+ * MAKEFUN_ENV_URL with its host name replaced by the address the system resolver finds for it, or
+ * undefined when there is nothing to resolve. The binary is statically linked and resolves names
+ * with its own resolver; given the address as well (it tries this URL first and the original one
+ * after it), a name that only the system's resolver configuration can resolve cannot keep it from
+ * reaching the environment.
+ */
+async function resolveEnvUrl(): Promise<string | undefined> {
+  try {
+    const url = new URL(process.env.MAKEFUN_ENV_URL ?? '');
+    if (url.protocol !== 'http:' || isIP(url.hostname.replace(/^\[|\]$/g, '')) !== 0) return undefined;
+    const giveUp = new Promise<never>((_, reject) => setTimeout(reject, 2000, new Error('lookup timed out')).unref());
+    const found = await Promise.race([lookup(url.hostname, { all: true }), giveUp]);
+    // An IPv4 address when there is one: it reaches a server bound to either address family.
+    const pick = found.find((a) => a.family === 4) ?? found[0];
+    if (pick === undefined) return undefined;
+    url.hostname = pick.family === 6 ? `[${pick.address}]` : pick.address;
+    return url.href;
+  } catch {
+    return undefined;
+  }
+}
 
 // Runtime settings for the binary; anything already set in the environment wins. The binary applies
 // the same defaults itself, so these only document them where an operator looks first.
-const env = { GOMAXPROCS: '1', GOGC: 'off', GOMEMLIMIT: '512MiB', ...process.env };
-
-let child: ChildProcess | undefined;
+const env: NodeJS.ProcessEnv = { GOMAXPROCS: '1', GOGC: 'off', GOMEMLIMIT: '512MiB', ...process.env };
 
 // Where to put an executable copy of the binary when the checkout's own file may not be executed
 // (a lost exec bit on a read-only mount, or a mount that forbids execution).
 const fallbackDirs = windows ? [tmpdir()] : [tmpdir(), '/dev/shm'];
+
+const binary = locateBinary();
+let child: ChildProcess | undefined;
 
 function fail(message: string): never {
   process.stderr.write(`[launcher] ${message}\n`);
@@ -72,4 +104,6 @@ for (const signal of ['SIGTERM', 'SIGINT'] as const) {
   });
 }
 
+const resolved = await resolveEnvUrl();
+if (resolved !== undefined) env.FORGE_ENV_URL = resolved;
 start(binary, 0);

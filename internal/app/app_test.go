@@ -115,7 +115,7 @@ func TestDispatch(t *testing.T) {
 	for path, want := range map[string]int{
 		"/adaiversen/missing.git/info/refs?service=git-upload-pack": 404,
 		"/olgabauer/real.git/info/refs?service=git-upload-pack":     404,
-		"/adaiversen/real.git/info/refs?service=git-upload-pack":    501, // until the git surface lands
+		"/adaiversen/real.git/info/refs?service=git-upload-pack":    200,
 	} {
 		if r := call(t, tester, "GET", path, "tok", ""); r.status != want {
 			t.Errorf("%s: %d, want %d", path, r.status, want)

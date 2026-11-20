@@ -40,11 +40,20 @@ not yours, ask for it; do not work around it inside your package.
 
 ## 2. Life cycle
 
-`node /bot/main.ts` spawns `bin/forge-linux-amd64` (Windows: `bin/forge-windows-amd64.exe`, or the
-copy `build.sh` leaves in `~/.cache/forge/` when the checkout was copied without ignored files, as
-the local grader does) with inherited stdio and environment, forwards SIGTERM and SIGINT, and exits
-with the binary's exit code. If the binary cannot be executed (`EACCES`), the launcher copies it to
-the temp directory (then `/dev/shm`), sets mode 755 and starts the copy.
+`node /bot/main.ts` spawns `bin/forge-linux-amd64` with inherited stdio and environment, forwards
+SIGTERM and SIGINT, and exits with the binary's exit code. Two things make it more than a spawn:
+
+- **Host name.** Before starting the binary it resolves the host of `MAKEFUN_ENV_URL` with the
+  system resolver (`dns.lookup`, 2 s limit) and passes the URL with the address in `FORGE_ENV_URL`.
+  The binary is static and resolves names with Go's own resolver; it tries `FORGE_ENV_URL` first and
+  `MAKEFUN_ENV_URL` after it (and sticks with whichever answered), so neither resolver alone can
+  cost the registration. An address, or a failed lookup, simply leaves `FORGE_ENV_URL` unset.
+- **Exec bit.** If the binary cannot be executed (`EACCES`), the launcher copies it to the temp
+  directory (then `/dev/shm`), sets mode 755 and starts the copy.
+
+Development only: `FORGE_BIN=<path>` runs another build, and where the platform's build is not in
+`bin/` (the Windows build is not committed, and the local grader runs a copy of the checkout made
+from git's file list) the launcher uses the copy `build.sh` keeps in `~/.cache/forge/`.
 
 The binary does everything else (`cmd/forge`):
 
@@ -467,16 +476,15 @@ as they are (`json.RawMessage`); do not decode and re-encode them.
 
 `rest.go` is the frame: `Serve` (auth, router, 404), `routes()` where every route is registered,
 `Fail` (store error -> reply), `Decode` (JSON object body or 400 `Problems parsing JSON`),
-`a.Repo(c, i)` (owner/repo parameters -> `*store.Repo`, or 404 and nil), `NotFound`. `GET /`, `/meta`
-and `/user` are implemented as examples of the conventions. Add handlers in other files of the
-package and register them in `routes()`.
+`a.Repo(c, i)` (owner/repo parameters -> `*store.Repo`, or 404 and nil), `NotFound`. `Message`
+replies with a bare message, `DecodeOptional` is `Decode` for routes whose body may be absent.
+Every route is registered in `routes()`; `HEAD` is answered by the `GET` handler.
 
-Still to do in this package: every other route of spec/REST.md section 4, pagination (`per_page`
-default 30, clamped 1..100; `page` default 1; turn them into `Offset`/`Limit`; `Link` with
-`rel="next"` and `rel="last"` built from `"http://" + c.Host` and the request's own query with only
-`page` replaced, set with `c.AddHeader("Link", ...)`), base64 for contents, and the statuses: 201 on
-create (also for `PutFile` when `res.Created`), 200 on update, 204 on repository delete via
-`c.Empty(204)`.
+Handlers live in `repos.go`, `git.go`, `contents.go`, `issues.go`, `pulls.go`; pagination and the
+`Link` header in `page.go` (`per_page` default 30, clamped 1..100; `page` default 1; `rel="next"`
+and `rel="last"` built from `"http://" + c.Host` and the request's own query with only `page`
+replaced); body field types and the issue-creation scanner in `decode.go`. Statuses: 201 on create
+(also for `PutFile` when `res.Created`), 200 on update, 204 on repository delete.
 
 ### GraphQL (`internal/graphql`)
 
@@ -500,11 +508,51 @@ URLs match what REST returns to the same client.
 
 ### Git (`internal/githttp`)
 
-The stub answers 404 for a missing repository and 501 otherwise. The protocol code will add pushed
-objects with `Objects.Add`, move refs with `SetRef`/`RemoveRef` after its own fast-forward test
-(`Objects.IsAncestor`), call `Store.Tick` once per push, and cache whole responses in `Repo.Git`
-(emptied by every ref change, keyed by the repository object, so a recreated repository never sees
-stale bytes).
+Files: `githttp.go` (routing, auth), `advert.go` (advertisements), `receive.go` (push), `pack.go`
+(pack reader with deltas, pack writer), `upload.go` (ls-refs, fetch, object selection), `pktline.go`.
+
+| Request | Answer |
+|---|---|
+| `GET info/refs?service=git-upload-pack` with `Git-Protocol: version=2` | one constant response for every repository: `version 2`, `ls-refs=unborn`, `fetch=shallow` (no `agent`, no `object-format`: a client that sees them must echo them in every command) |
+| same without the header | protocol v0 ref advertisement (`# service=git-upload-pack`), cached per ref state |
+| `GET info/refs?service=git-receive-pack` | always v0: every ref sorted by name, capabilities `report-status delete-refs side-band-64k ofs-delta` on the first line, or on `0{40} capabilities^{}` for an empty repository. The whole HTTP response is rendered once per ref state (`Repo.Git.AdvReceive`) |
+| `POST git-upload-pack`, `command=ls-refs` | HEAD first (`symref-target:` when asked, `unborn HEAD ...` for an unborn default branch when asked), refs sorted, `peeled:` for annotated tags, `ref-prefix` filtered on the server (HEAD included) |
+| `POST git-upload-pack`, `command=fetch` | `[acknowledgments]` only without `done`; `[shallow-info]` only when deepening; `packfile` in band-1 packets of at most 65520 bytes; always at least the 32-byte empty pack. Whole, undeltified objects, each once |
+| `POST git-upload-pack` starting with `want` | a basic protocol v0 fetch (shallow list, one ACK/NAK, pack with or without side-band) for old clients |
+| `POST git-receive-pack` | always HTTP 200 with a report: `unpack ok` or `unpack <error>`, then `ok <ref>` / `ng <ref> <reason>` per update in request order, inside band 1 when the client asked for `side-band-64k` |
+
+Push rules. The pack is verified (trailer SHA-1, every zlib stream and its Adler-32, declared sizes,
+entry count), deltas are resolved against the pack or the store (thin packs), and every new
+object's references must exist, in the pack or already stored; otherwise the pack's objects are
+taken out again and the updates that needed them are refused with `missing necessary objects`.
+Updates are independent: create (`old` zero) needs the ref to be absent, update needs `old` to be
+the current value and, for `refs/heads/*`, the current commit to be an ancestor of the new one
+(`non-fast-forward` otherwise), delete removes. A refused update still leaves `unpack ok` and the
+objects stored. Nothing is derived from history: the cost of a push is the cost of its pack.
+
+Fetch selection follows git's upload-pack (`selectObjects` in `upload.go` documents it): reachable
+from the wants, minus reachable from the haves, where commits the client holds as shallow and the
+new boundary of a `deepen` / `deepen-relative` / `deepen-since` / `deepen-not` request are cut points
+no walk continues past, and unshallowed commits contribute their parents as wants.
+
+Caching. `Repo.Git.Upload` maps the exact request body to the whole HTTP response for `ls-refs` and
+for fetches without `have` or `shallow` lines (the clone shape), at most 16 entries of at most 4 MiB.
+Every ref change (`refsChanged`, also from REST writes and merges) empties it and truncates the two
+advertisement buffers; the caches hang off the `*Repo`, so a repository deleted and created again
+starts clean. The store mutex makes cache fills single-flight: of fifty identical concurrent clones
+one builds the pack. Pushed objects keep the zlib stream they arrived in (`Object.Z`) and it goes
+out verbatim; objects made by the server get a stored-block stream on first use (`DB.Deflated`).
+
+Store functions for this surface (`store/gitsurface.go`): `Repo.RefB`, `SetRefB`, `RemoveRefB` take
+the ref name as bytes from the request body, so an update of an existing ref allocates nothing.
+`gitobj.NextEntry` iterates a tree without allocating; `DB.Remove` exists only for the rollback
+above. The surface calls `Store.Tick` once per push.
+
+Measured on the development machine (`go test ./internal/githttp/ -run xxx -bench . -benchmem`):
+one push of the push workload (advertisement GET + POST with a 3-object pack) 16 us, 0 allocs;
+one clone of the clone workload (5 requests) 3.1 us, 0 allocs. `TestRealGit` runs the git command
+line client against the surface (clone, shallow clone, deepen, unshallow, pull, delta pushes,
+refused pushes, protocol v0) wherever a git binary is installed.
 
 ---
 
@@ -520,3 +568,7 @@ bash build.sh        # both binaries; stages bin/forge-linux-amd64 with the exec
 runs a copy of the checkout made from git's file list, so new files must at least be untracked and
 not ignored, and the Windows build is found through `~/.cache/forge/` (written by `build.sh`).
 A local grade needs a fresh process each time (it always gets one): repository names are fixed.
+
+`build.sh` builds with `CGO_ENABLED=0 -trimpath -buildvcs=false -tags netgo,osusergo
+-ldflags "-s -w -buildid="`: no libc, so the Linux binary is static (the script refuses a binary
+that names a dynamic loader) and byte-for-byte reproducible from the sources.

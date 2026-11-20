@@ -1,0 +1,123 @@
+# The introspection part of the schema, as the GraphQL specification defines it. It is parsed and
+# resolved like the rest of the schema (the resolvers are in introspection.go), so what a client
+# reads through __schema and __type is the same registry that validation and execution use.
+
+# The meta-fields of the query root. __Meta is not a type of the schema: at start-up its fields
+# become available on the query root, which does not list them. (__typename, the third meta-field,
+# is answered by the executor for every object, interface and union.)
+type __Meta {
+  "Access the current type schema of this server."
+  __schema: __Schema!
+  "Request the type information of a single type."
+  __type("The name of the type." name: String!): __Type
+}
+
+"A GraphQL Schema defines the capabilities of a GraphQL server."
+type __Schema {
+  description: String
+  "A list of all types supported by this server."
+  types: [__Type!]!
+  "The type that query operations will be rooted at."
+  queryType: __Type!
+  "If this server supports mutation, the type that mutation operations will be rooted at."
+  mutationType: __Type
+  "If this server support subscription, the type that subscription operations will be rooted at."
+  subscriptionType: __Type
+  "A list of all directives supported by this server."
+  directives: [__Directive!]!
+}
+
+"The fundamental unit of any GraphQL Schema is the type."
+type __Type {
+  kind: __TypeKind!
+  name: String
+  description: String
+  specifiedByURL: String
+  fields(includeDeprecated: Boolean = false): [__Field!]
+  interfaces: [__Type!]
+  possibleTypes: [__Type!]
+  enumValues(includeDeprecated: Boolean = false): [__EnumValue!]
+  inputFields(includeDeprecated: Boolean = false): [__InputValue!]
+  ofType: __Type
+}
+
+"Object and Interface types are described by a list of Fields."
+type __Field {
+  name: String!
+  description: String
+  args(includeDeprecated: Boolean = false): [__InputValue!]!
+  type: __Type!
+  isDeprecated: Boolean!
+  deprecationReason: String
+}
+
+"Arguments provided to Fields or Directives and the input fields of an InputObject."
+type __InputValue {
+  name: String!
+  description: String
+  type: __Type!
+  "A GraphQL-formatted string representing the default value for this input value."
+  defaultValue: String
+  isDeprecated: Boolean!
+  deprecationReason: String
+}
+
+"One possible value for a given Enum."
+type __EnumValue {
+  name: String!
+  description: String
+  isDeprecated: Boolean!
+  deprecationReason: String
+}
+
+"A Directive provides a way to describe alternate runtime execution and type validation behavior."
+type __Directive {
+  name: String!
+  description: String
+  locations: [__DirectiveLocation!]!
+  args(includeDeprecated: Boolean = false): [__InputValue!]!
+  isRepeatable: Boolean!
+}
+
+"An enum describing what kind of type a given __Type is."
+enum __TypeKind {
+  "Indicates this type is a scalar."
+  SCALAR
+  "Indicates this type is an object. fields and interfaces are valid fields."
+  OBJECT
+  "Indicates this type is an interface. fields, interfaces and possibleTypes are valid fields."
+  INTERFACE
+  "Indicates this type is a union. possibleTypes is a valid field."
+  UNION
+  "Indicates this type is an enum. enumValues is a valid field."
+  ENUM
+  "Indicates this type is an input object. inputFields is a valid field."
+  INPUT_OBJECT
+  "Indicates this type is a list. ofType is a valid field."
+  LIST
+  "Indicates this type is a non-null. ofType is a valid field."
+  NON_NULL
+}
+
+"A Directive can be adjacent to many parts of the GraphQL language."
+enum __DirectiveLocation {
+  QUERY
+  MUTATION
+  SUBSCRIPTION
+  FIELD
+  FRAGMENT_DEFINITION
+  FRAGMENT_SPREAD
+  INLINE_FRAGMENT
+  VARIABLE_DEFINITION
+  SCHEMA
+  SCALAR
+  OBJECT
+  FIELD_DEFINITION
+  ARGUMENT_DEFINITION
+  INTERFACE
+  UNION
+  ENUM
+  ENUM_VALUE
+  INPUT_OBJECT
+  INPUT_FIELD_DEFINITION
+}

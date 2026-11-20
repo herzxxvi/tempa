@@ -291,3 +291,10 @@ func ValidPath(path string) bool {
 	}
 	return true
 }
+
+// NextEntry decodes the tree entry at the front of data and returns the bytes after it, without
+// allocating: name is a view into data. ok is false when data does not start with a well-formed
+// entry. Loop until rest is empty to visit a whole tree.
+func NextEntry(data []byte) (mode uint32, name []byte, id OID, rest []byte, ok bool) {
+	return nextEntry(data)
+}

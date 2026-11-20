@@ -4,6 +4,8 @@
 // It also runs the whole life cycle the grading environment expects:
 //
 //  1. MAKEFUN_ENV_URL names the environment. Without it there is nothing to serve: exit 1.
+//     (FORGE_ENV_URL, set by the launcher, is the same URL with the host already resolved; it is
+//     tried first and MAKEFUN_ENV_URL remains the fallback.)
 //  2. Listen on every interface at an OS-chosen port (never 8080) and start serving.
 //  3. Once /healthz answers, POST {"port": N} to $MAKEFUN_ENV_URL/register, retrying with backoff.
 //  4. Poll GET $MAKEFUN_ENV_URL/done until it says {"done": true}, then exit 0.
@@ -25,8 +27,7 @@ import (
 func main() {
 	tune()
 
-	envURL := os.Getenv("MAKEFUN_ENV_URL")
-	env, err := parseEndpoint(envURL)
+	env, err := newEnvironment(os.Getenv("MAKEFUN_ENV_URL"), os.Getenv("FORGE_ENV_URL"))
 	if err != nil {
 		logf("MAKEFUN_ENV_URL: " + err.Error())
 		os.Exit(1)

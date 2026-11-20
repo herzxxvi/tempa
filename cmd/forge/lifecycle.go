@@ -47,8 +47,48 @@ func parseEndpoint(raw string) (endpoint, error) {
 	return e, nil
 }
 
+// environment is the grading environment as this process can reach it: one or two URLs for the same
+// server. When the launcher resolved the environment's host name with the system resolver it passes
+// the resulting URL in FORGE_ENV_URL, and that one is tried first; MAKEFUN_ENV_URL itself, resolved
+// by Go's own resolver, is the other. Whichever answered last is used first the next time.
+type environment struct {
+	endpoints []endpoint
+	current   int
+}
+
+// newEnvironment builds the environment from the two variables. MAKEFUN_ENV_URL must be valid;
+// a missing or unusable FORGE_ENV_URL is simply not used.
+func newEnvironment(envURL, resolvedURL string) (*environment, error) {
+	original, err := parseEndpoint(envURL)
+	if err != nil {
+		return nil, err
+	}
+	env := &environment{}
+	if resolved, err := parseEndpoint(resolvedURL); err == nil && resolved != original {
+		// Same server, so the same Host header as the original URL would send.
+		resolved.host = original.host
+		env.endpoints = append(env.endpoints, resolved)
+	}
+	env.endpoints = append(env.endpoints, original)
+	return env, nil
+}
+
+// do performs one exchange with the environment, moving on to the other endpoint when one cannot
+// be reached at all. An HTTP answer of any status counts as reached.
+func (env *environment) do(method, path string, body []byte) (status int, response []byte, err error) {
+	for range env.endpoints {
+		status, response, err = request(env.endpoints[env.current], method, path, body, requestTimeout)
+		if err == nil {
+			return status, response, nil
+		}
+		env.current = (env.current + 1) % len(env.endpoints)
+	}
+	return 0, nil, err
+}
+
 const (
 	requestTimeout = 30 * time.Second
+	dialTimeout    = 3 * time.Second
 	retryInitial   = 250 * time.Millisecond
 	retryMax       = 2 * time.Second
 	maxResponse    = 1 << 20
@@ -61,7 +101,7 @@ func retryDelay(attempt int) time.Duration {
 
 // request performs one HTTP exchange and returns the status and the decoded body.
 func request(e endpoint, method, path string, body []byte, timeout time.Duration) (status int, response []byte, err error) {
-	conn, err := net.DialTimeout("tcp", e.addr, timeout)
+	conn, err := net.DialTimeout("tcp", e.addr, min(timeout, dialTimeout))
 	if err != nil {
 		return 0, nil, err
 	}
@@ -156,10 +196,10 @@ func waitHealthy(port int) bool {
 // register announces the port until the environment accepts it. 200 is the normal answer; 409 means
 // a register already won, which is fine; 400 and 405 are contract errors and fatal. Network errors
 // and other statuses are retried: the environment may still be starting.
-func register(e endpoint, port int) error {
+func register(env *environment, port int) error {
 	body := []byte(`{"port":` + strconv.Itoa(port) + `}`)
 	for attempt := 0; ; attempt++ {
-		status, response, err := request(e, "POST", "/register", body, requestTimeout)
+		status, response, err := env.do("POST", "/register", body)
 		if err == nil {
 			switch status {
 			case 200, 409:
@@ -174,9 +214,9 @@ func register(e endpoint, port int) error {
 
 // waitDone polls /done until the environment says the trial is over. Any error or any other answer
 // means "not done yet".
-func waitDone(e endpoint) {
+func waitDone(env *environment) {
 	for attempt := 0; ; attempt++ {
-		status, response, err := request(e, "GET", "/done", nil, requestTimeout)
+		status, response, err := env.do("GET", "/done", nil)
 		if err == nil && status == 200 {
 			var answer struct {
 				Done bool `json:"done"`

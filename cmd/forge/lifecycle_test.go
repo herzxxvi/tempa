@@ -134,14 +134,15 @@ func TestRegisterAndDone(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if err := register(e, 43210); err != nil {
+		env0 := &environment{endpoints: []endpoint{e}}
+		if err := register(env0, 43210); err != nil {
 			t.Fatalf("register (chunked=%v): %v", chunked, err)
 		}
 		if env.port.Load() != 43210 {
 			t.Fatalf("the environment saw port %d", env.port.Load())
 		}
 		finished := make(chan struct{})
-		go func() { waitDone(e); close(finished) }()
+		go func() { waitDone(env0); close(finished) }()
 		select {
 		case <-finished:
 		case <-time.After(5 * time.Second):
@@ -172,7 +173,7 @@ func TestRegisterContractError(t *testing.T) {
 		}
 	}()
 	e, _ := parseEndpoint("http://" + ln.Addr().String())
-	if err := register(e, 1); err == nil || !strings.Contains(err.Error(), "HTTP 400") || !strings.Contains(err.Error(), "bad_port") {
+	if err := register(&environment{endpoints: []endpoint{e}}, 1); err == nil || !strings.Contains(err.Error(), "HTTP 400") || !strings.Contains(err.Error(), "bad_port") {
 		t.Fatalf("register against a 400: %v", err)
 	}
 }
@@ -198,5 +199,39 @@ func TestParseResponse(t *testing.T) {
 		if ok != tc.ok || (ok && (status != tc.status || string(body) != tc.body)) {
 			t.Errorf("parseResponse(%q, %v) = %d %q %v", tc.raw, tc.eof, status, body, ok)
 		}
+	}
+}
+
+// The launcher's pre-resolved URL is tried first; when it leads nowhere the original URL is used,
+// and stays in use.
+func TestEnvironmentFallback(t *testing.T) {
+	env := startEnv(t, false)
+	dead, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadURL := "http://" + dead.Addr().String()
+	dead.Close() // nothing listens there any more
+	liveURL := "http://" + env.ln.Addr().String()
+
+	e, err := newEnvironment(liveURL, deadURL)
+	if err != nil || len(e.endpoints) != 2 || e.endpoints[0].addr != dead.Addr().String() || e.endpoints[0].host != e.endpoints[1].host {
+		t.Fatalf("newEnvironment: %+v %v", e, err)
+	}
+	if err := register(e, 4321); err != nil || env.port.Load() != 4321 || e.current != 1 {
+		t.Fatalf("register through the fallback: %v, port %d, current %d", err, env.port.Load(), e.current)
+	}
+	before := env.requests.Load()
+	if status, _, err := e.do("GET", "/done", nil); err != nil || status != 200 || env.requests.Load() != before+1 {
+		t.Fatalf("poll after the fallback: %d %v", status, err)
+	}
+	// The usual cases: no pre-resolved URL, the same URL twice, a broken one.
+	for _, resolved := range []string{"", liveURL, liveURL + "/", "not a url"} {
+		if e, err := newEnvironment(liveURL, resolved); err != nil || len(e.endpoints) != 1 {
+			t.Errorf("newEnvironment(%q, %q): %+v %v", liveURL, resolved, e, err)
+		}
+	}
+	if _, err := newEnvironment("", liveURL); err == nil {
+		t.Error("a missing MAKEFUN_ENV_URL must stay an error")
 	}
 }
