@@ -20,6 +20,7 @@ import (
 	"runtime"
 	"runtime/debug"
 	"strconv"
+	"time"
 
 	"forge/internal/app"
 	"forge/internal/httpd"
@@ -55,6 +56,7 @@ func main() {
 		Predict:     os.Getenv("FORGE_PREDICT") == "1",
 		DeferAccept: os.Getenv("FORGE_DEFER_ACCEPT") == "1",
 		Count:       os.Getenv("FORGE_STATS") == "1",
+		Yield:       threadsYield(),
 	}
 	go func() {
 		err := srv.Serve(ln)
@@ -120,11 +122,27 @@ func tune() {
 // and the netpoll loop everywhere else.
 var ioMode string
 
+// threadsYield is Server.Yield from FORGE_YIELD_MS, an option of the threads loop: the number of
+// milliseconds after which a connection's goroutine yields before it waits for its next request.
+// "0" means never; unset or anything else means the server's default.
+func threadsYield() time.Duration {
+	ms, err := strconv.Atoi(os.Getenv("FORGE_YIELD_MS"))
+	switch {
+	case err != nil || ms < 0:
+		return 0
+	case ms == 0:
+		return -1
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
 // ioLoop picks the socket I/O loop: FORGE_IO, else ioMode, else epoll on Linux and netpoll
 // elsewhere. "epoll" is the single-threaded epoll loop of internal/httpd; under a sandboxed kernel
 // it measured 1.39 ± 0.21 speed points above netpoll over 150 paired runs, with about 30 % fewer
-// system calls. Asking for it by name where it does not exist, or for anything unknown, falls back
-// to netpoll with one line of warning.
+// system calls. "threads" (Linux, an experiment) gives every connection a goroutine in a blocking
+// read; it wants GOMAXPROCS above the number of connections that are busy at once. Asking for a
+// loop by name where it does not exist, or for anything unknown, falls back to netpoll with one
+// line of warning.
 func ioLoop() string {
 	want := os.Getenv("FORGE_IO")
 	if want == "" {
@@ -143,8 +161,13 @@ func ioLoop() string {
 			return httpd.IOEpoll
 		}
 		logf("warning: the epoll loop is not available on this platform; using netpoll")
+	case httpd.IOThreads:
+		if httpd.ThreadsSupported {
+			return httpd.IOThreads
+		}
+		logf("warning: the threads loop is not available on this platform; using netpoll")
 	default:
-		logf("warning: unknown I/O loop " + strconv.Quote(want) + " (want netpoll or epoll); using netpoll")
+		logf("warning: unknown I/O loop " + strconv.Quote(want) + " (want netpoll, epoll or threads); using netpoll")
 	}
 	return httpd.IONetpoll
 }

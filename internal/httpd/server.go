@@ -49,7 +49,7 @@ type Server struct {
 	Token string
 	// DefaultHost stands in for a missing Host header when handlers build absolute URLs.
 	DefaultHost string
-	// IO selects the socket I/O loop: IONetpoll (also the meaning of "") or IOEpoll.
+	// IO selects the socket I/O loop: IONetpoll (also the meaning of ""), IOEpoll or IOThreads.
 	IO string
 	// Predict, DeferAccept and Count are options of the epoll loop; the netpoll loop ignores the
 	// first two.
@@ -63,6 +63,10 @@ type Server struct {
 	DeferAccept bool
 	// Count keeps the counters that StatsLine reports.
 	Count bool
+	// Yield is an option of the threads loop: a connection's goroutine passes through the scheduler
+	// before it waits for a request once this much time has gone by since it last did (threads_linux.go
+	// says why). 0 means the default of 5 ms; a negative value means never.
+	Yield time.Duration
 
 	stats        *ioStats
 	predictAfter int // tests: arm the predictive read after this many exchanges; 0 = the default
@@ -72,6 +76,7 @@ type Server struct {
 	seq          atomic.Uint64
 	pool         sync.Pool
 	stopping     atomic.Bool
+	threads      atomic.Pointer[threads] // the threads loop while it is serving, for Shutdown
 }
 
 func (s *Server) init() {
@@ -118,7 +123,7 @@ func Listen() (*net.TCPListener, error) {
 	}
 }
 
-// The two ways the engine can do its socket I/O. Everything above the sockets (parsing, dispatch,
+// The three ways the engine can do its socket I/O. Everything above the sockets (parsing, dispatch,
 // response assembly, buffer management) is the same code in both.
 const (
 	// IONetpoll is the portable default: one goroutine per connection on Go's net package.
@@ -126,23 +131,35 @@ const (
 	// IOEpoll is a single-threaded, level-triggered epoll loop on raw system calls (Linux only):
 	// one wait, one read and one write per exchange, and nothing for the Go scheduler to do.
 	IOEpoll = "epoll"
+	// IOThreads gives every connection a goroutine that waits in a blocking read on a blocking
+	// socket (Linux only): one read and one write per exchange, at the price of a thread per open
+	// connection. Connections beyond threadsMax are served the IONetpoll way.
+	IOThreads = "threads"
 )
 
-// Serve serves connections until the listener is closed (or, for the epoll loop, until Shutdown).
-// With IO set to IOEpoll on a platform that has no epoll loop, it serves with IONetpoll.
+// Serve serves connections until the listener is closed (or, for the epoll and threads loops, until
+// Shutdown). With IO set to IOEpoll or IOThreads on a platform that has no such loop, it serves
+// with IONetpoll.
 func (s *Server) Serve(ln *net.TCPListener) error {
 	s.init()
-	if s.IO == IOEpoll && EpollSupported {
+	switch {
+	case s.IO == IOEpoll && EpollSupported:
 		return s.serveEpoll(ln)
+	case s.IO == IOThreads && ThreadsSupported:
+		return s.serveThreads(ln)
 	}
 	return s.serveNetpoll(ln)
 }
 
-// Shutdown makes Serve return: it closes the listener and, in the epoll loop, every connection.
-// The netpoll loop's established connections end when their clients close them.
+// Shutdown makes Serve return: it closes the listener and, in the epoll and threads loops, every
+// connection they hold. The netpoll loop's established connections end when their clients close
+// them.
 func (s *Server) Shutdown(ln *net.TCPListener) {
 	s.stopping.Store(true)
 	ln.Close()
+	if th := s.threads.Load(); th != nil {
+		th.halt()
+	}
 }
 
 func (s *Server) serveNetpoll(ln *net.TCPListener) error {
@@ -173,15 +190,18 @@ func isClosed(err error) bool {
 // StatsLine is the counters kept with Count, as one line: connections accepted, requests served,
 // the most connections open at once, reads that found nothing (EAGAIN), and the predictive reads
 // that found their request (hits) or gave up waiting (misses). Only the request count is kept by
-// the netpoll loop. It is empty without Count.
+// the netpoll loop; the threads loop keeps the first three. It is empty without Count.
 func (s *Server) StatsLine() string {
 	s.init()
 	if s.stats == nil {
 		return ""
 	}
-	io := s.IO
-	if io != IOEpoll || !EpollSupported {
-		io = IONetpoll
+	io := IONetpoll
+	switch {
+	case s.IO == IOEpoll && EpollSupported:
+		io = IOEpoll
+	case s.IO == IOThreads && ThreadsSupported:
+		io = IOThreads
 	}
 	return s.stats.line(io)
 }
