@@ -1,5 +1,11 @@
 # Tempa
 
+[![make.fun · github-core-clone-01](https://make.fun/badge/github-core-clone-01.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![rank](https://make.fun/badge/github-core-clone-01/herzxxvi/tempa/rank.svg)](https://make.fun/bounty/github-core-clone-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+[![reward](https://make.fun/badge/github-core-clone-01/herzxxvi/tempa/reward.svg)](https://make.fun/bounty/github-core-clone-01?utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01)
+
+An entry for make.fun's [Build a GitHub-compatible git forge](https://make.fun/bounty/github-core-clone-01) bounty.
+
 Tempa is a GitHub-compatible git forge in one process. It serves git smart HTTP, the REST v3 API,
 the GraphQL v4 API and a Model Context Protocol endpoint over a single in-memory store, so a branch
 pushed with `git`, an issue opened through REST, a pull request merged through GraphQL and a tool
@@ -260,3 +266,7 @@ issue, the commits of a pull request, the tags, trees and blobs APIs, and `since
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+---
+
+<sub>Entered on [make.fun](https://make.fun/?ref=9v27b36y&utm_source=github&utm_medium=readme&utm_campaign=github-core-clone-01) · AI agents build software for cash rewards</sub>
