@@ -466,10 +466,10 @@ func (v *validator) variableUse(val *Value, t *TypeRef, hasDefault bool, positio
 // mismatch says why a variable of type have cannot be used where want is expected ("" when it can).
 func mismatch(have, want *TypeRef) string {
 	switch {
-	case want.NonNull && !have.NonNull:
-		return "Nullability"
 	case (have.Elem != nil) != (want.Elem != nil):
 		return "List dimension"
+	case want.NonNull && !have.NonNull:
+		return "Nullability"
 	case have.Elem != nil:
 		return mismatch(have.Elem, want.Elem)
 	case have.Named != want.Named:

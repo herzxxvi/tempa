@@ -150,7 +150,8 @@ type DirectiveDef struct {
 // resolver produces the value of a field of src. Arguments arrive coerced to their declared types.
 type resolver func(q *query, src any, a args) (any, error)
 
-// metaType is the pseudo-type in introspection.graphql that declares __schema and __type. Resolvers are registered on it before the schema is linked; linking dissolves it.
+// metaType is the pseudo-type in introspection.graphql that declares __schema and __type.
+// Resolvers are registered on it before the schema is linked; linking dissolves it.
 const metaType = "__Meta"
 
 // Schema is the whole type system.

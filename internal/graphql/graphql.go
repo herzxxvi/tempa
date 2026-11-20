@@ -50,8 +50,10 @@ var schema = sync.OnceValues(func() (*Schema, error) {
 const (
 	// maxQueryBytes is the longest document accepted.
 	maxQueryBytes = 1 << 20
-	// maxPrepared is how many parsed and validated documents are kept for reuse.
-	maxPrepared = 256
+	// maxPrepared is how many parsed and validated documents are kept for reuse, and
+	// maxPreparedBytes how long a document may be to be kept.
+	maxPrepared      = 256
+	maxPreparedBytes = 16 << 10
 )
 
 // API serves /api/graphql.
@@ -199,10 +201,12 @@ func (a *API) prepare(src string) *prepared {
 	} else {
 		p.doc, p.errs = doc, a.schema.validate(doc)
 	}
-	if len(a.prepared) >= maxPrepared {
-		clear(a.prepared)
+	if len(src) <= maxPreparedBytes {
+		if len(a.prepared) >= maxPrepared {
+			clear(a.prepared)
+		}
+		a.prepared[src] = p
 	}
-	a.prepared[src] = p
 	return p
 }
 
