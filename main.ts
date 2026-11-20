@@ -54,7 +54,8 @@ async function resolveEnvUrl(): Promise<string | undefined> {
 }
 
 // Runtime settings for the binary; anything already set in the environment wins. The binary applies
-// the first three itself as well, so those only document them where an operator looks first.
+// the first three and FORGE_IO itself as well, so those only document them where an operator looks
+// first.
 //
 // GODEBUG=schedtrace=<a very long interval> is not about tracing. Go's monitor thread goes into a
 // deep sleep whenever the program is idle, which a server with one worker is between any two
@@ -64,11 +65,17 @@ async function resolveEnvUrl(): Promise<string | undefined> {
 // stays on its ordinary 10 ms tick and nobody has to wake it. The interval is 23 days, so no trace
 // line is ever printed. The runtime reads this before the program's own code runs, so it can only
 // be set here.
+//
+// FORGE_IO=epoll (Linux; FORGE_IO=netpoll switches back): the binary's own epoll loop instead of
+// Go's netpoller. In a gVisor lab it measured +1.39 ± 0.21 speed points over netpoll across 150
+// paired runs, with no failure in 185 runs and 43k -> 30.5k system calls per pass. The Windows
+// build has no such loop and keeps the netpoller, so nothing is set there.
 const env: NodeJS.ProcessEnv = {
   GOMAXPROCS: '1',
   GOGC: 'off',
   GOMEMLIMIT: '256MiB',
   GODEBUG: 'schedtrace=2000000000',
+  ...(windows ? {} : { FORGE_IO: 'epoll' }),
   ...process.env,
 };
 

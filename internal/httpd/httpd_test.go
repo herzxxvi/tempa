@@ -59,6 +59,9 @@ type client struct {
 // them a second time on the epoll loop.
 var testIO = IONetpoll
 
+// testTune, when set, adjusts the server of every test in this file before it starts.
+var testTune func(*Server)
+
 func start(t *testing.T, h Handler) (*Server, *client) {
 	t.Helper()
 	ln, err := Listen()
@@ -66,6 +69,9 @@ func start(t *testing.T, h Handler) (*Server, *client) {
 		t.Fatal(err)
 	}
 	srv := &Server{Handler: h, Token: "secret", DefaultHost: "fallback:1", IO: testIO}
+	if testTune != nil {
+		testTune(srv)
+	}
 	go srv.Serve(ln)
 	t.Cleanup(func() { srv.Shutdown(ln) })
 	conn, err := net.Dial("tcp", "127.0.0.1:"+strconv.Itoa(ln.Addr().(*net.TCPAddr).Port))

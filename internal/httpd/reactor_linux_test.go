@@ -26,7 +26,13 @@ import (
 func TestEpollRunsTheEngineTests(t *testing.T) {
 	testIO = IOEpoll
 	defer func() { testIO = IONetpoll }()
-	for name, test := range map[string]func(*testing.T){
+	for name, test := range engineTests() {
+		t.Run(name, test)
+	}
+}
+
+func engineTests() map[string]func(*testing.T) {
+	return map[string]func(*testing.T){
 		"KeepAliveAndHeaders":                  TestKeepAliveAndHeaders,
 		"RequestIDsAreUnique":                  TestRequestIDsAreUnique,
 		"PipelinedRequestsAnswerInOrder":       TestPipelinedRequestsAnswerInOrder,
@@ -43,20 +49,23 @@ func TestEpollRunsTheEngineTests(t *testing.T) {
 		"Auth":                                 TestAuth,
 		"HostileHostIsReplaced":                TestHostileHostIsReplaced,
 		"BufferGrowthIsBounded":                TestBufferGrowthIsBounded,
-	} {
-		t.Run(name, test)
 	}
 }
 
 // epollServer starts a server on the epoll loop and returns its address.
 func epollServer(t *testing.T, h Handler) string {
 	t.Helper()
+	return runEpoll(t, &Server{Handler: h, Token: "secret", DefaultHost: "fallback:1", IO: IOEpoll})
+}
+
+// runEpoll starts srv, which must be set up for the epoll loop, and returns its address.
+func runEpoll(t *testing.T, srv *Server) string {
+	t.Helper()
 	ln, err := Listen()
 	if err != nil {
 		t.Fatal(err)
 	}
 	addr := "127.0.0.1:" + strconv.Itoa(ln.Addr().(*net.TCPAddr).Port)
-	srv := &Server{Handler: h, Token: "secret", DefaultHost: "fallback:1", IO: IOEpoll}
 	stopped := make(chan error, 1)
 	go func() { stopped <- srv.Serve(ln) }()
 	t.Cleanup(func() {
@@ -413,5 +422,365 @@ func TestEpollWithOneP(t *testing.T) {
 	}
 	if handled.Load() != 200 {
 		t.Errorf("the handler ran %d times, want 200", handled.Load())
+	}
+}
+
+// The predictive read (Server.Predict) on real sockets: accepted sockets in blocking mode, reads
+// that wait with a limit, and everything else exactly as before.
+
+// predictServer starts a server on the epoll loop with predictive reads and counters.
+func predictServer(t *testing.T, h Handler) (string, *Server) {
+	t.Helper()
+	srv := &Server{Handler: h, Token: "secret", DefaultHost: "fallback:1", IO: IOEpoll, Predict: true, Count: true}
+	return runEpoll(t, srv), srv
+}
+
+// twoPs makes sure the test's clients can run while the loop sits in a waiting read: in one
+// process with one P they could not, and every such read would run into its limit.
+func twoPs(t *testing.T) {
+	t.Helper()
+	if runtime.NumCPU() < 2 {
+		t.Skip("needs two CPUs: the client must run while the server waits in a read")
+	}
+	if runtime.GOMAXPROCS(0) < 2 {
+		before := runtime.GOMAXPROCS(2)
+		t.Cleanup(func() { runtime.GOMAXPROCS(before) })
+	}
+}
+
+// exchange sends one GET for tag on conn and checks the reply.
+func exchange(conn net.Conn, r *bufio.Reader, tag string) error {
+	if _, err := io.WriteString(conn, "GET "+tag+get); err != nil {
+		return err
+	}
+	if status, body, err := readResponse(r); err != nil || status != 200 || string(body) != tag+"|" {
+		return fmt.Errorf("%s: %d %q %v", tag, status, body, err)
+	}
+	return nil
+}
+
+// TestPredictRunsTheEngineTests repeats the socket tests of httpd_test.go with every experiment of
+// the loop switched on, and with the predictive read armed after two exchanges instead of 32, so
+// that requests in pieces, chunked bodies, pipelines and closes all meet the waiting read.
+func TestPredictRunsTheEngineTests(t *testing.T) {
+	twoPs(t)
+	testIO, testTune = IOEpoll, func(srv *Server) {
+		srv.Predict, srv.DeferAccept, srv.Count, srv.predictAfter = true, true, true, 2
+	}
+	defer func() { testIO, testTune = IONetpoll, nil }()
+	for name, test := range engineTests() {
+		t.Run(name, test)
+	}
+}
+
+func TestPredictSequentialClientOnSockets(t *testing.T) {
+	twoPs(t)
+	var handled atomic.Int64
+	addr, srv := predictServer(t, sizeHandler(&handled))
+	conn, r := dial(t, addr)
+	const rounds = 2000
+	for i := 0; i < rounds; i++ {
+		// Replies of different sizes now and then, so a repeated or misplaced one cannot pass.
+		if i%100 == 99 {
+			io.WriteString(conn, "GET /bytes/"+strconv.Itoa(1000+i)+get)
+			if status, body, err := readResponse(r); err != nil || status != 200 || string(body) != string(pattern(1000+i)) {
+				t.Fatalf("round %d: %d, %d bytes, %v", i, status, len(body), err)
+			}
+			continue
+		}
+		if err := exchange(conn, r, "/seq/"+strconv.Itoa(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if handled.Load() != rounds {
+		t.Errorf("the handler ran %d times, want %d", handled.Load(), rounds)
+	}
+	hits, misses := srv.stats.hits.Load(), srv.stats.misses.Load()
+	t.Logf("%s", srv.StatsLine())
+	if hits < rounds/4 {
+		t.Errorf("only %d of %d requests were found by a predictive read (%d misses)", hits, rounds, misses)
+	}
+}
+
+func TestPredictTwoAlternatingClientsOnSockets(t *testing.T) {
+	twoPs(t)
+	var handled atomic.Int64
+	addr, srv := predictServer(t, sizeHandler(&handled))
+	connA, rA := dial(t, addr)
+	connB, rB := dial(t, addr)
+	const rounds = 1000
+	for i := 0; i < rounds; i++ {
+		if err := exchange(connA, rA, "/a/"+strconv.Itoa(i)); err != nil {
+			t.Fatal(err)
+		}
+		if err := exchange(connB, rB, "/b/"+strconv.Itoa(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if handled.Load() != 2*rounds {
+		t.Errorf("the handler ran %d times, want %d", handled.Load(), 2*rounds)
+	}
+	t.Logf("%s", srv.StatsLine())
+	if hits := srv.stats.hits.Load(); hits < rounds/2 {
+		t.Errorf("only %d of %d requests were found by a predictive read (%d misses)", hits, 2*rounds, srv.stats.misses.Load())
+	}
+}
+
+// A second connection must not wait behind the predicted one for longer than the limits allow: one
+// waiting read (3 ms) when the predicted connection has gone quiet, one window of predictive reads
+// (2 ms) when it is busy. Scheduling noise is taken out by measuring several times and judging the
+// best; every single measurement must still be far from a stall.
+func TestPredictDoesNotStarveASecondConnection(t *testing.T) {
+	twoPs(t)
+	addr, srv := predictServer(t, sizeHandler(nil))
+	connA, rA := dial(t, addr)
+	connB, rB := dial(t, addr)
+	if err := exchange(connB, rB, "/b/hello"); err != nil {
+		t.Fatal(err)
+	}
+	seq := 0
+	sequential := func(n int) {
+		t.Helper()
+		for i := 0; i < n; i++ {
+			seq++
+			if err := exchange(connA, rA, "/a/"+strconv.Itoa(seq)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	judge := func(what string, took []time.Duration) {
+		t.Helper()
+		best, worst := took[0], took[0]
+		for _, d := range took {
+			best, worst = min(best, d), max(worst, d)
+		}
+		t.Logf("%s: the second connection waited %v", what, took)
+		if best > 5*time.Millisecond {
+			t.Errorf("%s: the second connection was never answered within 5 ms (best %v)", what, best)
+		}
+		if worst > 250*time.Millisecond {
+			t.Errorf("%s: the second connection waited %v", what, worst)
+		}
+	}
+
+	// The predicted connection goes quiet: the loop is in a waiting read on it when the second
+	// connection's request arrives. Each such miss raises the streak the loop asks for, so enough
+	// exchanges go before each measurement to arm it again whatever that has become.
+	var quiet []time.Duration
+	for try := 0; try < 5; try++ {
+		sequential(predictMost + 8)
+		start := time.Now()
+		if err := exchange(connB, rB, "/b/quiet/"+strconv.Itoa(try)); err != nil {
+			t.Fatal(err)
+		}
+		quiet = append(quiet, time.Since(start))
+	}
+	judge("predicted connection quiet", quiet)
+	if srv.stats.hits.Load() == 0 {
+		t.Errorf("no predictive read ever found a request, so this measured nothing: %s", srv.StatsLine())
+	}
+
+	// The predicted connection stays busy, one request after the other, for the whole time.
+	stop := make(chan struct{})
+	busyDone := make(chan error, 1)
+	connC, rC := dial(t, addr)
+	go func() {
+		for i := 0; ; i++ {
+			select {
+			case <-stop:
+				busyDone <- nil
+				return
+			default:
+			}
+			if err := exchange(connC, rC, "/c/"+strconv.Itoa(i)); err != nil {
+				busyDone <- err
+				return
+			}
+		}
+	}()
+	var busy []time.Duration
+	for try := 0; try < 8; try++ {
+		time.Sleep(60 * time.Millisecond) // long enough for the busy connection to be predicted again
+		start := time.Now()
+		if err := exchange(connB, rB, "/b/busy/"+strconv.Itoa(try)); err != nil {
+			t.Fatal(err)
+		}
+		busy = append(busy, time.Since(start))
+	}
+	close(stop)
+	if err := <-busyDone; err != nil {
+		t.Fatal(err)
+	}
+	judge("predicted connection busy", busy)
+	t.Logf("%s", srv.StatsLine())
+}
+
+func TestPredictPipeliningOnSockets(t *testing.T) {
+	twoPs(t)
+	var handled atomic.Int64
+	addr, srv := predictServer(t, sizeHandler(&handled))
+	conn, r := dial(t, addr)
+	for i := 0; i < 3*predictAfter; i++ {
+		if err := exchange(conn, r, "/warm/"+strconv.Itoa(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Three requests in one segment, again and again: each batch is one read for the server, and
+	// the three replies must come back in order.
+	for i := 0; i < 300; i++ {
+		tags := [3]string{"/p/" + strconv.Itoa(i) + "/x", "/p/" + strconv.Itoa(i) + "/y", "/p/" + strconv.Itoa(i) + "/z"}
+		io.WriteString(conn, "GET "+tags[0]+get+"GET "+tags[1]+get+"GET "+tags[2]+get)
+		for _, tag := range tags {
+			if status, body, err := readResponse(r); err != nil || status != 200 || string(body) != tag+"|" {
+				t.Fatalf("pipelined %s: %d %q %v", tag, status, body, err)
+			}
+		}
+	}
+	// A request that arrives in two parts, the second after the waiting read has returned the first.
+	for i := 0; i < 20; i++ {
+		for j := 0; j < 3*predictAfter; j++ {
+			if err := exchange(conn, r, "/between/"+strconv.Itoa(i)+"/"+strconv.Itoa(j)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		body := strings.Repeat("b", 100+i)
+		whole := "POST /split/" + strconv.Itoa(i) + " HTTP/1.1\r\nHost: h\r\nContent-Length: " + strconv.Itoa(len(body)) + "\r\n\r\n" + body
+		io.WriteString(conn, whole[:len(whole)-50])
+		time.Sleep(time.Millisecond)
+		io.WriteString(conn, whole[len(whole)-50:])
+		if status, got, err := readResponse(r); err != nil || status != 200 || string(got) != "/split/"+strconv.Itoa(i)+"|"+body {
+			t.Fatalf("split request %d: %d %q %v", i, status, got, err)
+		}
+	}
+	want := int64(3*predictAfter + 900 + 20*(3*predictAfter+1))
+	if handled.Load() != want {
+		t.Errorf("the handler ran %d times, want %d", handled.Load(), want)
+	}
+	t.Logf("%s", srv.StatsLine())
+}
+
+// Half-closes with the loop in its waiting read: a client that sends its last request and closes
+// its side gets the reply and then the server's close; a client that just closes its side gets the
+// close. Nothing is left open.
+func TestPredictHalfClose(t *testing.T) {
+	twoPs(t)
+	addr, srv := predictServer(t, sizeHandler(nil))
+	warm := func(conn net.Conn, r *bufio.Reader) {
+		t.Helper()
+		for i := 0; i < 3*predictAfter; i++ {
+			if err := exchange(conn, r, "/warm/"+strconv.Itoa(i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	// Once without counting, so the pool and the tables have their size.
+	conn, r := dial(t, addr)
+	warm(conn, r)
+	conn.Close()
+	time.Sleep(50 * time.Millisecond)
+	before := openDescriptors(t)
+
+	for i := 0; i < 20; i++ {
+		conn, err := net.Dial("tcp", addr)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tcp := conn.(*net.TCPConn)
+		tcp.SetDeadline(time.Now().Add(20 * time.Second))
+		r := bufio.NewReader(conn)
+		warm(conn, r)
+		if i%2 == 0 {
+			io.WriteString(conn, "GET /last"+get)
+			tcp.CloseWrite()
+			if status, body, err := readResponse(r); err != nil || status != 200 || string(body) != "/last|" {
+				t.Fatalf("half-closed exchange %d: %d %q %v", i, status, body, err)
+			}
+		} else {
+			tcp.CloseWrite()
+		}
+		if _, err := r.ReadByte(); err != io.EOF {
+			t.Fatalf("connection %d: after a half-close the server should close, got %v", i, err)
+		}
+		conn.Close()
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for openDescriptors(t) > before && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if after := openDescriptors(t); after > before {
+		t.Errorf("descriptors: %d before, %d after 20 connections", before, after)
+	}
+	t.Logf("%s", srv.StatsLine())
+	if srv.stats.hits.Load() == 0 {
+		t.Error("no predictive read ever found a request, so this tested nothing")
+	}
+}
+
+// One P, clients in the same process: nobody can send while the loop holds the processor in a
+// waiting read, so every such read runs into its limit. That must cost a few milliseconds a time
+// and less and less often, never a stall or a lost request, and other goroutines must keep running.
+func TestPredictWithOneP(t *testing.T) {
+	defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(1))
+	var handled atomic.Int64
+	addr, srv := predictServer(t, sizeHandler(&handled))
+	ticks := make(chan struct{}, 1)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		ticks <- struct{}{}
+	}()
+	conn, r := dial(t, addr)
+	start := time.Now()
+	// With one P a client in this process is only woken by the runtime's monitor thread, some
+	// milliseconds after its reply was sent, so the rounds are few: enough to arm the read at 34
+	// exchanges and again, with the doubled requirement, at 98.
+	const rounds = 120
+	for i := 0; i < rounds; i++ {
+		if err := exchange(conn, r, "/one/"+strconv.Itoa(i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Logf("%d exchanges in %v; %s", rounds, time.Since(start), srv.StatsLine())
+	select {
+	case <-ticks:
+	case <-time.After(5 * time.Second):
+		t.Error("a timer in another goroutine never fired while the loop was running")
+	}
+	if handled.Load() != rounds {
+		t.Errorf("the handler ran %d times, want %d", handled.Load(), rounds)
+	}
+	if misses := srv.stats.misses.Load(); misses < 1 || misses > 3 {
+		t.Errorf("%d predictive reads ran into their limit; with the back-off it should be 2", misses)
+	}
+	if hits := srv.stats.hits.Load(); hits != 0 {
+		t.Logf("%d predictive reads found a request although the client could not run", hits)
+	}
+}
+
+// The deferred accept path on its own: connections are read straight after being accepted, and a
+// client that connects and stays silent for a while is still served when it finally speaks.
+func TestEpollDeferAccept(t *testing.T) {
+	var handled atomic.Int64
+	srv := &Server{Handler: sizeHandler(&handled), IO: IOEpoll, DeferAccept: true, Count: true}
+	addr := runEpoll(t, srv)
+	for i := 0; i < 50; i++ {
+		conn, r := dial(t, addr)
+		for j := 0; j < 3; j++ {
+			if err := exchange(conn, r, "/d/"+strconv.Itoa(i)+"/"+strconv.Itoa(j)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		conn.Close()
+	}
+	quiet, r := dial(t, addr)
+	time.Sleep(1500 * time.Millisecond)
+	if err := exchange(quiet, r, "/late"); err != nil {
+		t.Fatal(err)
+	}
+	if handled.Load() != 151 {
+		t.Errorf("the handler ran %d times, want 151", handled.Load())
+	}
+	t.Logf("%s", srv.StatsLine())
+	if accepted := srv.stats.accepted.Load(); accepted != 51 {
+		t.Errorf("%d connections accepted, want 51", accepted)
 	}
 }

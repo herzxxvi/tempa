@@ -1,6 +1,10 @@
 package httpd
 
-import "syscall"
+import (
+	"strconv"
+	"sync/atomic"
+	"syscall"
+)
 
 // The epoll loop, part one: what happens to a connection when the operating system says it is
 // ready. This half has no system calls in it: it talks to the kernel through a small interface, so
@@ -35,6 +39,13 @@ type kernel interface {
 	watch(fd int, add, writable bool) bool
 	// close closes fd, which also ends the watch.
 	close(fd int)
+	// patient prepares fd for await: from now on a waiting read on it gives up after awaitMillis.
+	// It is called once per connection, before its first await, and reports whether that holds;
+	// await is never called on a descriptor it refused.
+	patient(fd int) bool
+	// await is a read that waits for data, for at most awaitMillis: EAGAIN when nothing came in
+	// that time, EINTR when the wait was interrupted. It is the one call that may block.
+	await(fd int, p []byte) (n int, errno syscall.Errno)
 }
 
 // loop is the connection table and the per-connection state machine of the epoll loop.
@@ -43,6 +54,39 @@ type loop struct {
 	k      kernel
 	conns  []*Ctx // by descriptor
 	closed func() // called after a connection was closed (a slot became free)
+
+	// Counters for Server.StatsLine; nil unless Server.Count is set.
+	stats *ioStats
+	live  int // open connections (kept only with stats)
+
+	// The predictive read (Server.Predict); see chase.
+	predict    bool
+	lone       bool // the wait being handled reported exactly one descriptor
+	last, prev int  // the connections of the last two exchanges, newest first
+	streak     int  // exchanges in a row that came alone and on the connection of the one before last
+	after      int  // the streak that arms the predictive read to begin with (predictAfter)
+	want       int  // the streak that arms it now: after, or more following misses
+	calm       int  // predictive reads that found their request, since the last one that did not
+}
+
+// The predictive read's tuning.
+const (
+	awaitMillis  = 3    // how long a predictive read waits for its request
+	predictAfter = 32   // exchanges that must follow the pattern before the first predictive read
+	predictMost  = 1024 // the longest streak that is asked for after repeated misses
+	predictCalm  = 256  // hits in a row after which the requirement is back where it started
+)
+
+// ioStats is what FORGE_STATS reports. The loop's goroutine writes, the exit path reads.
+type ioStats struct {
+	accepted, requests, peak, again, hits, misses atomic.Int64
+}
+
+func (st *ioStats) line(io string) string {
+	n := func(v *atomic.Int64) string { return strconv.FormatInt(v.Load(), 10) }
+	return "stats: io=" + io + " accepted=" + n(&st.accepted) + " requests=" + n(&st.requests) +
+		" max_conns=" + n(&st.peak) + " read_eagain=" + n(&st.again) +
+		" predict_hits=" + n(&st.hits) + " predict_misses=" + n(&st.misses)
 }
 
 // maxDescriptor bounds the connection table; a descriptor beyond it is refused.
@@ -70,6 +114,13 @@ func (l *loop) open(fd int) {
 		l.conns = append(l.conns, make([]*Ctx, max(64, len(l.conns)))...)
 	}
 	l.conns[fd] = c
+	l.streak = 0 // the set of connections changed: the pattern has to show again
+	if l.stats != nil {
+		l.live++
+		if int64(l.live) > l.stats.peak.Load() {
+			l.stats.peak.Store(int64(l.live))
+		}
+	}
 	if !l.k.watch(fd, true, false) {
 		l.end(c)
 	}
@@ -95,6 +146,8 @@ func (l *loop) ready(c *Ctx) {
 	if errno != 0 {
 		if errno != syscall.EAGAIN && errno != syscall.EINTR {
 			l.end(c)
+		} else if l.stats != nil && errno == syscall.EAGAIN {
+			l.stats.again.Add(1)
 		}
 		return
 	}
@@ -102,11 +155,116 @@ func (l *loop) ready(c *Ctx) {
 		l.end(c) // the client closed its side; everything it sent has been answered
 		return
 	}
+	if !l.predict {
+		l.took(c, n)
+		return
+	}
+	fd := c.fd
+	l.note(fd, l.took(c, n))
+}
+
+// took handles n bytes just read into c: every complete request is answered and the replies are
+// written. It reports whether that was a whole exchange and nothing else: something was answered
+// and sent in full, and the connection is still open with nothing pending in either direction.
+func (l *loop) took(c *Ctx, n int) bool {
+	fd := c.fd
 	c.end += n
 	l.srv.answer(c)
-	if len(c.out) == 0 || l.flush(c) {
+	if len(c.out) == 0 {
 		l.settled(c)
+		return false
 	}
+	if !l.flush(c) {
+		return false
+	}
+	l.settled(c)
+	return l.conn(fd) == c && c.end == 0 && len(c.out) == 0
+}
+
+// note records the outcome of one read for the predictive read: fd's connection had an exchange
+// (whole says whether it was a complete one). The pattern looked for is the one sequential clients
+// produce: one request at a time, each on the connection of the request before the last one. One
+// connection used over and over fits it, and so do two used in turn.
+func (l *loop) note(fd int, whole bool) {
+	if !whole {
+		l.streak = 0
+		return
+	}
+	if l.lone && fd == l.prev {
+		l.streak++
+	} else {
+		l.streak = 0
+	}
+	l.prev, l.last = l.last, fd
+}
+
+// enablePredict switches the predictive read on. after is the streak that arms it; 0 means
+// predictAfter (tests arm it sooner).
+func (l *loop) enablePredict(after int) {
+	if after <= 0 {
+		after = predictAfter
+	}
+	l.predict, l.after, l.want, l.last, l.prev = true, after, after, -1, -1
+}
+
+// armed reports whether the next request is expected on a known connection, so that chase may wait
+// for it there.
+func (l *loop) armed() bool { return l.predict && l.streak >= l.want }
+
+// chase is the predictive read. Once the last predictAfter exchanges have followed the pattern of
+// note, the next request is expected on the connection l.prev, and instead of asking the wait which
+// descriptor is ready and then reading it, chase reads that connection with a read that waits: one
+// system call instead of two. It handles one such read and reports whether to go on with another.
+//
+// What it costs when the guess is wrong: the read gives up after awaitMillis, and for that long
+// nothing else is served (another connection's request, a new connection). So a miss doubles the
+// streak asked for before the next attempt, up to predictMost exchanges, and a long run of hits
+// brings it back down. A read that fails in any way hands over to the ordinary wait, which finds
+// whatever is ready; no byte is read twice or skipped, because the read is the same read either way.
+func (l *loop) chase() bool {
+	c := l.conn(l.prev)
+	if c == nil || c.blocked || c.end != 0 || len(c.out) != 0 {
+		l.streak = 0
+		return false
+	}
+	fd := c.fd
+	if !c.patient {
+		if !l.k.patient(fd) {
+			l.predict = false // a read that cannot be bounded is never made
+			return false
+		}
+		c.patient = true
+	}
+	n, errno := l.k.await(fd, c.in)
+	if errno != 0 {
+		switch errno {
+		case syscall.EINTR:
+			// The runtime wants the processor. No verdict on the guess: the wait takes over for
+			// this exchange, and the streak goes on if the request comes where it was expected.
+		case syscall.EAGAIN:
+			l.streak, l.calm = 0, 0
+			l.want = min(2*l.want, predictMost)
+			if l.stats != nil {
+				l.stats.misses.Add(1)
+			}
+		default:
+			l.end(c)
+		}
+		return false
+	}
+	if n == 0 {
+		l.end(c)
+		return false
+	}
+	if l.calm++; l.calm >= predictCalm {
+		l.want = l.after
+	}
+	if l.stats != nil {
+		l.stats.hits.Add(1)
+	}
+	l.lone = true
+	l.note(fd, l.took(c, n))
+	return l.streak >= l.want
 }
 
 // flush writes what is pending in c.out. It returns true when all of it is gone. When the socket
@@ -160,6 +318,10 @@ func (l *loop) end(c *Ctx) {
 		return
 	}
 	l.conns[fd] = nil
+	l.streak = 0
+	if l.stats != nil {
+		l.live--
+	}
 	l.k.close(fd)
 	c.fd = -1
 	c.out, c.written, c.blocked = c.out[:0], 0, false

@@ -129,9 +129,9 @@ The full description, including the store's API and the conventions each surface
   off with a 256 MiB memory limit as backstop (a full conformance and benchmark session allocates
   about 21 MiB in total), and a `GODEBUG` setting that keeps Go's monitor thread from being woken
   with a futex call on every request. Each yields to the standard environment variable.
-- **An optional Linux epoll loop.** `FORGE_IO=epoll` serves all connections from one goroutine on
-  raw, level-triggered epoll: one wait, one read and one send per exchange. The default remains Go's
-  netpoller. The connection state machine is separate from the system calls and is tested on every
+- **A Linux epoll loop.** On Linux all connections are served from one goroutine on raw,
+  level-triggered epoll: one wait, one read and one send per exchange (`FORGE_IO=netpoll` switches
+  back to Go's netpoller, which every other platform uses). The connection state machine is separate from the system calls and is tested on every
   platform against a scripted kernel.
 - **Bounded input.** Request bodies up to 32 MiB, headers up to 16 KiB, packs up to 96 MiB inflated
   and 32 MiB per object; a size claimed by a client is never allocated in advance.
@@ -173,7 +173,8 @@ git clone http://x:change-me@127.0.0.1:40871/adaiversen/demo.git
 |---|---|
 | `MAKEFUN_ENV_URL` | required; `http://` URL of the environment that receives the registration |
 | `MAKEFUN_SHOP_TOKEN` | the bearer token; if empty, any credentials are accepted (a warning is logged) |
-| `FORGE_IO` | `netpoll` (default) or `epoll` (Linux) |
+| `FORGE_IO` | `epoll` (Linux only, the default there) or `netpoll` (the default elsewhere) |
+| `FORGE_PREDICT`, `FORGE_DEFER_ACCEPT`, `FORGE_STATS` | `1` switches on an experiment of the epoll loop: predictive reads, the deferred accept path, a line of I/O counters at exit |
 | `FORGE_BIN` | development: path of another build for `main.ts` to start |
 | `GOMAXPROCS`, `GOGC`, `GOMEMLIMIT`, `GODEBUG` | override the runtime defaults described above |
 

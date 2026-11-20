@@ -69,13 +69,14 @@ type Ctx struct {
 	fd      int  // the connection's descriptor
 	written int  // bytes of out already sent
 	blocked bool // the socket would not take all of out: waiting for it to become writable
+	patient bool // the descriptor has been prepared for the predictive read (kernel.patient)
 }
 
 func (c *Ctx) resetConn() {
 	c.start, c.end, c.scanned, c.need = 0, 0, 0, 0
 	c.out = c.out[:0]
 	c.closeAfter, c.wantContinue, c.sent100, c.replied = false, false, false, false
-	c.written, c.blocked = 0, false
+	c.written, c.blocked, c.patient = 0, false, false
 	c.chunked, c.chunkPos = c.chunked[:0], 0
 }
 

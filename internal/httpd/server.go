@@ -51,19 +51,36 @@ type Server struct {
 	DefaultHost string
 	// IO selects the socket I/O loop: IONetpoll (also the meaning of "") or IOEpoll.
 	IO string
+	// Predict, DeferAccept and Count are options of the epoll loop; the netpoll loop ignores the
+	// first two.
+	//
+	// Predict lets the loop wait for the next request with a read on the connection it expects it
+	// on, once the traffic has shown a sequential pattern (reactor.go, chase).
+	Predict bool
+	// DeferAccept asks the kernel to report a new connection only once its first bytes are there
+	// (TCP_DEFER_ACCEPT), reads it straight after accepting it, and stops setting TCP_NODELAY on
+	// every connection once the first one shows that the listener's setting is inherited.
+	DeferAccept bool
+	// Count keeps the counters that StatsLine reports.
+	Count bool
 
-	once        sync.Once
-	bearer      []byte // "Bearer <Token>", the exact header value the suite's clients send
-	defaultHost []byte
-	seq         atomic.Uint64
-	pool        sync.Pool
-	stopping    atomic.Bool
+	stats        *ioStats
+	predictAfter int // tests: arm the predictive read after this many exchanges; 0 = the default
+	once         sync.Once
+	bearer       []byte // "Bearer <Token>", the exact header value the suite's clients send
+	defaultHost  []byte
+	seq          atomic.Uint64
+	pool         sync.Pool
+	stopping     atomic.Bool
 }
 
 func (s *Server) init() {
 	s.once.Do(func() {
 		s.bearer = []byte("Bearer " + s.Token)
 		s.defaultHost = []byte(s.DefaultHost)
+		if s.Count {
+			s.stats = &ioStats{}
+		}
 		s.pool.New = func() any {
 			return &Ctx{
 				srv:     s,
@@ -153,6 +170,22 @@ func isClosed(err error) bool {
 	return err == net.ErrClosed
 }
 
+// StatsLine is the counters kept with Count, as one line: connections accepted, requests served,
+// the most connections open at once, reads that found nothing (EAGAIN), and the predictive reads
+// that found their request (hits) or gave up waiting (misses). Only the request count is kept by
+// the netpoll loop. It is empty without Count.
+func (s *Server) StatsLine() string {
+	s.init()
+	if s.stats == nil {
+		return ""
+	}
+	io := s.IO
+	if io != IOEpoll || !EpollSupported {
+		io = IONetpoll
+	}
+	return s.stats.line(io)
+}
+
 // answer handles every complete request buffered in c and appends the responses to c.out, in
 // order. A body that is known to be incomplete is not re-parsed until enough bytes have arrived.
 // Afterwards c.closeAfter says whether the connection ends once c.out has been written. This is
@@ -168,6 +201,9 @@ func (s *Server) answer(c *Ctx) {
 			return
 		}
 		s.dispatch(c)
+		if s.stats != nil {
+			s.stats.requests.Add(1)
+		}
 		c.start += used
 		c.scanned, c.need, c.sent100, c.wantContinue = 0, 0, false, false
 		if c.closeAfter {

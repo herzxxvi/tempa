@@ -86,8 +86,13 @@ set it stays on its ordinary 10 ms tick instead. Under a sandboxed kernel that r
 10,000 futex calls per session and shortened the timed workloads by 1 to 6 %. The interval is 23 days,
 so nothing is ever printed. An operator's own `GODEBUG` wins.
 
-`FORGE_IO` chooses the socket I/O loop: `netpoll` (the default) or `epoll` (Linux; section 4.5).
-The first log line names the loop in use.
+`FORGE_IO` chooses the socket I/O loop: `epoll` (Linux, where it is the default; section 4.5) or
+`netpoll` (the default everywhere else). The first log line names the loop in use. Three
+experiments of the epoll loop are off unless their variable is `1`: `FORGE_PREDICT` (wait for the
+next request with a read on the connection a sequential client is expected to use, two system
+calls per exchange instead of three), `FORGE_DEFER_ACCEPT` (`TCP_DEFER_ACCEPT`, read straight after
+accept, no per-connection `TCP_NODELAY` once it is seen to be inherited) and `FORGE_STATS` (one
+line of I/O counters at exit).
 
 Memory. A complete session (the 120 conformance checks and the four benchmark workloads) allocates
 about 21 MiB in total and obtains 27 to 31 MiB from the operating system; the collector never runs.
@@ -235,12 +240,12 @@ Everything above the socket is one code path: `Server.answer` parses and answers
 request in a connection's input buffer and appends the responses to its output buffer, and
 `Ctx.settle` prepares the buffer for the next read. The loops only move bytes.
 
-**netpoll** (`ServeConn` in `server.go`; every platform; the default). One goroutine per connection
-on Go's `net` package: read, answer, write, repeat. On a persistent connection one exchange costs
+**netpoll** (`ServeConn` in `server.go`; every platform; the default outside Linux). One goroutine
+per connection on Go's `net` package: read, answer, write, repeat. On a persistent connection one exchange costs
 about four and a half system calls: the read, the write, a second read that only learns there is
 nothing more (`EAGAIN`), and the runtime's own epoll polling.
 
-**epoll** (`reactor.go`, `reactor_linux.go`; Linux; `FORGE_IO=epoll`). All connections on one
+**epoll** (`reactor.go`, `reactor_linux.go`; Linux, the default there). All connections on one
 goroutine, driven by a level-triggered epoll instance through raw, non-blocking system calls. One
 exchange costs three system calls (wait, read, write), and when several connections are ready at
 once they share the wait.
