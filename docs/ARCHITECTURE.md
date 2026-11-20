@@ -27,6 +27,7 @@ internal/rest/          REST surface      (/api/v3/...)
 internal/graphql/       GraphQL surface   (/api/graphql)
 internal/mcp/           MCP surface       (/mcp)
 internal/githttp/       git surface       (/{owner}/{repo}.git/...)
+README.md               overview: what each surface supports, how to run, how it was verified
 docs/ARCHITECTURE.md    this file
 ```
 
@@ -66,8 +67,8 @@ The binary does everything else (`cmd/forge`):
 5. Poll `GET <env>/done` with the same backoff until the body says `{"done":true}`; exit 0.
 
 The life cycle lives in the Go binary, not in `main.ts`, on purpose: there is no port to hand over a
-pipe, the Node process stays completely idle (it would otherwise run a `fetch` every two seconds on
-the machine the benchmark is timed on), and the client is 150 lines with tests against both response
+pipe, the Node process stays completely idle (it would otherwise run a `fetch` every two seconds
+next to the server it started), and the client is 150 lines with tests against both response
 framings (`cmd/forge/lifecycle_test.go`). The process writes three lines to stderr in its whole life
 (a fourth, a warning, if `MAKEFUN_SHOP_TOKEN` is empty) and nothing per request. The last line
 reports the memory the run used.
@@ -156,8 +157,9 @@ provides the check, `c.Auth()`.
 type Handler func(c *httpd.Ctx)
 ```
 
-Request side. All byte slices are **views into the connection's input buffer**: valid until your
-handler returns, never to be stored. Convert to `string` (which copies) before keeping anything.
+Request side. All byte slices are **views into the connection's input buffer**: valid until the
+handler returns, never to be stored. A handler converts to `string` (which copies) before keeping
+anything.
 
 | | |
 |---|---|
@@ -168,11 +170,11 @@ handler returns, never to be stored. Convert to `string` (which copies) before k
 | `c.Authorization`, `c.ContentType`, `c.Accept`, `c.GitProtocol` | trimmed header values, nil when absent |
 | `c.Header("mcp-method")` | any other header; pass the name in lowercase |
 | `c.Auth()` | `httpd.AuthNone` (no header), `AuthBad`, `AuthOK`. Accepts `Bearer <t>`, `token <t>` (scheme in any case) and Basic with the token as password |
-| `c.Param(i)`, `c.ParamString(i)`, `c.ParamInt(i)` | i-th captured route parameter: raw / percent-decoded / digits only (anything else, or more than 18 digits: `ok == false`, which you answer with 404) |
+| `c.Param(i)`, `c.ParamString(i)`, `c.ParamInt(i)` | i-th captured route parameter: raw / percent-decoded / digits only (anything else, or more than 18 digits: `ok == false`, which a handler answers with 404) |
 | `c.QueryRaw(k)`, `c.QueryString(k)`, `c.QueryInt(k, def)` | query parameters: raw / decoded (`+` and `%XX`) / number |
 | `httpd.Unescape(dst, src, plus)`, `httpd.ParseInt(b)` | the primitives behind those |
 
-Response side. Call exactly one of these:
+Response side. A handler calls exactly one of these:
 
 | | |
 |---|---|
@@ -192,8 +194,8 @@ c.Scratch = b          // keep the grown capacity for the next request
 c.JSON(200, b)
 ```
 
-Never hand `c.Scratch` to something that keeps it, and never assign a slice you do not own (a
-cached tail, a constant) to `c.Scratch`: the next request would overwrite it.
+`c.Scratch` is never handed to something that keeps it, and a slice the handler does not own (a
+cached tail, a constant) is never assigned to it: the next request would overwrite that slice.
 
 ### 4.3 Router
 
@@ -418,7 +420,7 @@ viewer; the time is the logical clock.
 |---|---|
 | `r.CreatePull(NewPull{Title, Body, Head, Base, Draft}) (*Pull, error)` | `Head` may be `branch` or `owner:branch` (prefix dropped). Both branches must exist as `refs/heads/*`. 422 `Validation Failed`, resource `PullRequest`: `missing_field` title/head/base; `invalid` head (missing branch, or head == base); `invalid` base; `custom` `A pull request already exists for adaiversen:<head>.` when an **open** one has the same head and base. "No commits between" is not an error. Next shared number; body `""` when absent |
 | `r.Pull(number) *Pull` | nil when absent or the number is an issue |
-| `r.ListPulls(PullQuery{State, Head, Base, Sort, Asc, Offset, Limit}, dst) (page, total)` | default open only; `StateClosed` includes merged. `Sort`: created (number) or updated. For GraphQL's `MERGED` / `CLOSED` distinction filter `r.Pulls` yourself (it is in number order) |
+| `r.ListPulls(PullQuery{State, Head, Base, Sort, Asc, Offset, Limit}, dst) (page, total)` | default open only; `StateClosed` includes merged. `Sort`: created (number) or updated. GraphQL, which tells `MERGED` from `CLOSED`, filters `r.Pulls` (number order) itself |
 | `r.UpdatePull(p, PullPatch{Title, Body, State}) error` | edit, close, reopen. 422: empty title, bad state, reopening a merged pull request |
 | `r.PullInfo(p) *PullInfo` | everything that depends on git state, computed from the **current** refs and cached until a tip moves: `Head`, `Base` (branch tips; frozen once closed or merged, `Base` = the tip merged onto), `MergeBase`, `Mergeable` (`MergeClean`, `MergeConflicting`, `MergeUnknown` for closed/merged), `Files []FileChange{Path, Status ("added"/"removed"/"modified"), Additions, Deletions, Blob}` = merge base -> head, sorted by path, `Commits`, `Additions`, `Deletions`. Read-only |
 | `r.MergePull(p, MergeOptions{Method, CommitTitle, CommitMessage, SHA}) (*gitobj.Object, error)` | decided **now, against the current base tip**, by a three-way tree merge (path level, no line merging). `squash` and `rebase`: one commit, parent = base tip, tree = merge result, message `<title> (#<n>)` plus `CommitMessage` or a `* subject` list. `merge` (the default when `Method` is empty): parents `[base tip, head tip]`. The base ref moves; the pull request becomes `Closed`, `Merged`, `MergedAt = ClosedAt = now`, `MergeCommit` set; the head branch stays. Errors: **405 `Pull Request is not mergeable`** (not open, a branch gone, or conflict: nothing is written), 409 `Head branch was modified...` (`SHA` given and not the head tip), 422 unknown method. Returns the new commit; the REST reply is `render.AppendMergeResult` |
@@ -465,8 +467,8 @@ type Error struct {
 - Fixed texts are constants: `MsgNotMergeable`, `MsgEmptyRepo`, `MsgEmptyGit`, `MsgHeadModified`,
   `MsgMerged`.
 
-Do not re-validate in a surface what the store validates, and do not invent a different message for
-the same failure: call the store and report its error.
+A surface does not validate again what the store validates and has no message of its own for the
+same failure: it calls the store and reports the store's error.
 
 ---
 
@@ -504,10 +506,11 @@ Rules the renderers keep, and that any new renderer must keep:
 issue; `c.JSONTail(200, render.IssueTail(c.Host, is))` then serves it with two appends. The store
 drops the tail whenever the issue changes (edit, close, reopen, comment, label change) and a
 repository rename invalidates all of them (`JSONGen`); a different `Host` re-renders. Nothing else
-needs to know: always go through `IssueTail` / `AppendIssue`, never cache issue JSON yourself.
+needs to know: every surface goes through `IssueTail` / `AppendIssue` and none keeps issue JSON of
+its own.
 
-If a surface needs to wrap a rendered object (MCP's `structuredContent`), embed the rendered bytes
-as they are (`json.RawMessage`); do not decode and re-encode them.
+A surface that wraps a rendered object (MCP's `structuredContent`) embeds the rendered bytes as
+they are; it does not decode and re-encode them.
 
 ---
 
@@ -587,9 +590,9 @@ Files: `githttp.go` (routing, auth), `advert.go` (advertisements), `receive.go` 
 Push rules. The pack is verified (trailer SHA-1, every zlib stream and its Adler-32, declared sizes,
 entry count) within fixed limits (32 MiB per object and 96 MiB per pack once inflated; a declared
 size is only ever backed by memory as the data arrives), deltas are resolved against the pack or the
-store (thin packs), and every new
-object's references must exist, in the pack or already stored; otherwise the pack's objects are
-taken out again and the updates that needed them are refused with `missing necessary objects`.
+store (thin packs), and every new object's references must exist, in the pack or already stored;
+otherwise the pack's objects are taken out again and the updates that needed them are refused with
+`missing necessary objects`.
 Updates are independent: create (`old` zero) needs the ref to be absent, update needs `old` to be
 the current value and, for `refs/heads/*`, the current commit to be an ancestor of the new one
 (`non-fast-forward` otherwise), delete removes. A refused update still leaves `unpack ok` and the
