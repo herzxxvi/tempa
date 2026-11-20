@@ -162,7 +162,10 @@ func TestEpollPartialWrites(t *testing.T) {
 	addr := epollServer(t, sizeHandler(nil))
 	const big = 24 << 20
 	slow, slowReader := dial(t, addr)
-	slow.SetReadBuffer(16 << 10) // keep the kernel from absorbing much of it
+	// Keep the kernel from absorbing much of it, but no smaller than one loopback segment (64 KiB):
+	// below that, Linux falls into zero-window pacing at about 150 kB a second and 24 MiB take
+	// minutes, whichever loop serves them.
+	slow.SetReadBuffer(64 << 10)
 	if _, err := io.WriteString(slow, "GET /bytes/"+strconv.Itoa(big)+get+"GET /after-1"+get+"GET /bytes/70000"+get+"GET /after-2"+get); err != nil {
 		t.Fatal(err)
 	}
