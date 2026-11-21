@@ -60,13 +60,19 @@ type reactor struct {
 	// DeferAccept: eager says a connection is accepted only once it has sent something, so it is
 	// read at once; probe and inherit are about TCP_NODELAY coming with the listener's socket.
 	eager, probe, inherit bool
+	// The hybrid loop (hybrid_linux.go): the connections served outside the loop; nil otherwise.
+	hy *hybrid
 
 	events [epollBatch]syscall.EpollEvent
 }
 
 // serveEpoll takes over the listener's socket and runs the loop. If the loop cannot be set up, it
 // serves with the netpoll loop instead: a server that is up beats a faster one that is not.
-func (s *Server) serveEpoll(ln *net.TCPListener) error {
+func (s *Server) serveEpoll(ln *net.TCPListener) error { return s.serveLoop(ln, false) }
+
+// serveLoop is serveEpoll, and with hybrid set the same loop lending out connections that are used
+// sequentially (hybrid_linux.go).
+func (s *Server) serveLoop(ln *net.TCPListener, hybrid bool) error {
 	file, err := ln.File() // a duplicate descriptor; the socket stays open when ln is closed
 	if err != nil {
 		return s.serveNetpoll(ln)
@@ -96,7 +102,19 @@ func (s *Server) serveEpoll(ln *net.TCPListener) error {
 	ln.Close() // the runtime's poller no longer watches the socket; this loop does
 	rx := &reactor{epfd: epfd, lfd: lfd, lfile: file}
 	rx.loop = loop{srv: s, k: rx, closed: rx.resumeAccept, stats: s.stats}
-	if s.Predict {
+	switch {
+	case hybrid:
+		// Blocking sockets, as with Predict: the loop says MSG_DONTWAIT on every call, and a
+		// goroutine that is lent a connection waits on it with plain reads and writes.
+		rx.blocking, rx.dontWait = true, msgDontWait
+		rx.hy = newHybrid(s, epfd)
+		rx.track, rx.last, rx.prev = true, -1, -1
+		rx.lend, rx.lendAfter = rx.promote, int(rx.hy.after)
+		s.hybrid.Store(rx.hy)
+		if s.stopping.Load() {
+			rx.hy.halt() // Shutdown ran before it could see the loop
+		}
+	case s.Predict:
 		rx.blocking, rx.dontWait = true, msgDontWait
 		rx.enablePredict(s.predictAfter)
 	}
@@ -115,10 +133,28 @@ func (rx *reactor) run() error {
 	// and a yield would only wake an idle thread to look for work.
 	yield := runtime.GOMAXPROCS(0) == 1
 	batches := 0
+	// The hybrid loop only: whether the last wait found nothing, and when this goroutine last came
+	// from the scheduler, as far as it knows.
+	hy, idle := rx.hy, false
+	var since time.Time
+	if hy != nil {
+		since = time.Now()
+	}
 	for {
-		n, _, errno := syscall.RawSyscall6(syscall.SYS_EPOLL_PWAIT, uintptr(rx.epfd),
-			uintptr(unsafe.Pointer(&rx.events[0])), epollBatch, epollWaitMillis, 0, 0)
+		var n uintptr
+		var errno syscall.Errno
+		if hy != nil && (idle || hy.away.Load() > 0) {
+			// Nothing to do here, or the busy connection is being served elsewhere: a long wait
+			// that the scheduler knows about, so that this thread sleeps until there is an event
+			// and the P is free for others (hybrid_linux.go).
+			n, _, errno = syscall.Syscall6(syscall.SYS_EPOLL_PWAIT, uintptr(rx.epfd),
+				uintptr(unsafe.Pointer(&rx.events[0])), epollBatch, hybridWaitMillis, 0, 0)
+		} else {
+			n, _, errno = syscall.RawSyscall6(syscall.SYS_EPOLL_PWAIT, uintptr(rx.epfd),
+				uintptr(unsafe.Pointer(&rx.events[0])), epollBatch, epollWaitMillis, 0, 0)
+		}
 		if errno != 0 || n == 0 {
+			idle = errno == 0
 			// Nothing to do, or interrupted (the runtime asking this goroutine to make way): the
 			// moment for housekeeping and for letting other goroutines run.
 			if errno != 0 && errno != syscall.EINTR {
@@ -139,6 +175,7 @@ func (rx *reactor) run() error {
 		// Connections first, the listener last: a connection accepted now may get the descriptor
 		// number of one closed in this batch, and must not be handed that one's event.
 		accept := false
+		idle = false
 		rx.lone = n == 1
 		for i := 0; i < int(n); i++ {
 			fd := int(rx.events[i].Fd)
@@ -146,10 +183,33 @@ func (rx *reactor) run() error {
 				accept = true
 			} else if c := rx.conn(fd); c != nil {
 				rx.ready(c)
+			} else if hy != nil {
+				// A connection that a goroutine has given back: it is in the wait's set again but
+				// not yet in the table. (Or the wake-up of halt, which the check below answers.)
+				if c := hy.reclaim(fd); c != nil {
+					rx.adopt(c)
+					rx.ready(c)
+				}
 			}
 		}
 		if accept {
 			rx.accept()
+		}
+		if hy != nil {
+			if rx.srv.stopping.Load() {
+				rx.shutdown()
+				return net.ErrClosed
+			}
+			// With Ps to spare this goroutine never yields below, and one that has not passed
+			// through the scheduler for 10 ms is interrupted by the monitor thread with a signal,
+			// again and again. Passing through it in time is cheaper. The clock is read without a
+			// system call.
+			if !yield {
+				if now := time.Now(); now.Sub(since) >= hybridYield {
+					runtime.Gosched()
+					since = time.Now()
+				}
+			}
 		}
 		if batches++; batches >= yieldEvery && yield {
 			batches = 0
@@ -240,6 +300,13 @@ func (rx *reactor) resumeAccept() {
 // shutdown closes everything the loop owns.
 func (rx *reactor) shutdown() {
 	rx.closed = nil
+	if rx.hy != nil {
+		// The connections that are out come to an end on their goroutines; the ones that were
+		// given back and not asked about since are closed here with the rest.
+		for _, c := range rx.hy.stop() {
+			rx.adopt(c)
+		}
+	}
 	rx.endAll()
 	syscall.Close(rx.epfd)
 	rx.lfile.Close()

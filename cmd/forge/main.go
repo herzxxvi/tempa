@@ -47,11 +47,19 @@ func main() {
 		logf("warning: MAKEFUN_SHOP_TOKEN is empty; any credentials will be accepted")
 	}
 	forge := app.New()
+	io := ioLoop()
+	if io == httpd.IOHybrid && runtime.GOMAXPROCS(0) < hybridProcs {
+		// A lent connection's goroutine needs a P of its own while the loop holds one in its wait,
+		// and both want idle Ps beside them: with those the scheduler leaves a goroutine in a
+		// short system call alone, and one that returns from a long one finds a P without waking
+		// a thread. This overrides tune and the GOMAXPROCS variable when they say less.
+		runtime.GOMAXPROCS(hybridProcs)
+	}
 	srv := &httpd.Server{
 		Handler:     forge.Serve,
 		Token:       token,
 		DefaultHost: "127.0.0.1:" + strconv.Itoa(port),
-		IO:          ioLoop(),
+		IO:          io,
 		// Experiments of the epoll loop, each off unless its variable is exactly "1".
 		Predict:     os.Getenv("FORGE_PREDICT") == "1",
 		DeferAccept: os.Getenv("FORGE_DEFER_ACCEPT") == "1",
@@ -117,6 +125,9 @@ func tune() {
 	}
 }
 
+// hybridProcs is the least GOMAXPROCS the hybrid loop runs with.
+const hybridProcs = 4
+
 // ioMode is the socket I/O loop used when FORGE_IO does not choose one. It can be set at link time
 // (-ldflags "-X main.ioMode=netpoll"); empty means the epoll loop where the build has it (Linux)
 // and the netpoll loop everywhere else.
@@ -140,7 +151,9 @@ func threadsYield() time.Duration {
 // elsewhere. "epoll" is the single-threaded epoll loop of internal/httpd; under a sandboxed kernel
 // it measured 1.39 ± 0.21 speed points above netpoll over 150 paired runs, with about 30 % fewer
 // system calls. "threads" (Linux, an experiment) gives every connection a goroutine in a blocking
-// read; it wants GOMAXPROCS above the number of connections that are busy at once. Asking for a
+// read; it wants GOMAXPROCS above the number of connections that are busy at once. "hybrid" (Linux,
+// an experiment) is the epoll loop lending a connection that is used alone, one request after the
+// other, to such a goroutine for as long as that lasts; main gives it hybridProcs Ps. Asking for a
 // loop by name where it does not exist, or for anything unknown, falls back to netpoll with one
 // line of warning.
 func ioLoop() string {
@@ -166,8 +179,13 @@ func ioLoop() string {
 			return httpd.IOThreads
 		}
 		logf("warning: the threads loop is not available on this platform; using netpoll")
+	case httpd.IOHybrid:
+		if httpd.HybridSupported {
+			return httpd.IOHybrid
+		}
+		logf("warning: the hybrid loop is not available on this platform; using netpoll")
 	default:
-		logf("warning: unknown I/O loop " + strconv.Quote(want) + " (want netpoll, epoll or threads); using netpoll")
+		logf("warning: unknown I/O loop " + strconv.Quote(want) + " (want netpoll, epoll, threads or hybrid); using netpoll")
 	}
 	return httpd.IONetpoll
 }

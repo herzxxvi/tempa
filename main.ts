@@ -70,6 +70,11 @@ async function resolveEnvUrl(): Promise<string | undefined> {
 // Go's netpoller. In a gVisor lab it measured +1.39 ± 0.21 speed points over netpoll across 150
 // paired runs, with no failure in 185 runs and 43k -> 30.5k system calls per pass. The Windows
 // build has no such loop and keeps the netpoller, so nothing is set there.
+//
+// FORGE_IO=hybrid (Linux, an experiment): the epoll loop, lending a connection that is used alone,
+// one request after the other, to a goroutine in a blocking read (two system calls per exchange
+// instead of three) until it goes quiet. That needs spare Ps, so the binary runs it with
+// GOMAXPROCS=4 whatever is set here.
 const env: NodeJS.ProcessEnv = {
   GOMAXPROCS: '1',
   GOGC: 'off',

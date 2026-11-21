@@ -59,6 +59,15 @@ type loop struct {
 	stats *ioStats
 	live  int // open connections (kept only with stats)
 
+	// The hybrid loop (IOHybrid): lend, when set, is offered a connection whose exchange just now
+	// extended a sequential streak of at least lendAfter, and may take it out of the loop to serve it
+	// on a goroutine of its own (hybrid_linux.go). A connection it took is no longer in conns.
+	lend      func(c *Ctx)
+	lendAfter int
+
+	// The sequential streak, kept when track is set: by the predictive read and by the hybrid loop.
+	track bool
+
 	// The predictive read (Server.Predict); see chase.
 	predict    bool
 	lone       bool // the wait being handled reported exactly one descriptor
@@ -155,12 +164,40 @@ func (l *loop) ready(c *Ctx) {
 		l.end(c) // the client closed its side; everything it sent has been answered
 		return
 	}
-	if !l.predict {
+	if !l.track {
 		l.took(c, n)
 		return
 	}
 	fd := c.fd
-	l.note(fd, l.took(c, n))
+	whole := l.took(c, n)
+	l.note(fd, whole)
+	if whole && l.lend != nil && l.streak >= l.lendAfter {
+		l.lend(c)
+	}
+}
+
+// adopt puts a connection that was served outside the loop back into the table. The caller has
+// made sure that the wait reports it again.
+func (l *loop) adopt(c *Ctx) {
+	fd := c.fd
+	for fd >= len(l.conns) {
+		l.conns = append(l.conns, make([]*Ctx, max(64, len(l.conns)))...)
+	}
+	l.conns[fd] = c
+	l.streak = 0 // the set of connections changed: the pattern has to show again
+	if l.stats != nil {
+		l.live++
+	}
+}
+
+// part takes a connection out of the table without closing it: from now on it is served outside
+// the loop, which must not touch it until adopt.
+func (l *loop) part(c *Ctx) {
+	l.conns[c.fd] = nil
+	l.streak = 0
+	if l.stats != nil {
+		l.live--
+	}
 }
 
 // took handles n bytes just read into c: every complete request is answered and the replies are
@@ -204,7 +241,7 @@ func (l *loop) enablePredict(after int) {
 	if after <= 0 {
 		after = predictAfter
 	}
-	l.predict, l.after, l.want, l.last, l.prev = true, after, after, -1, -1
+	l.predict, l.track, l.after, l.want, l.last, l.prev = true, true, after, after, -1, -1
 }
 
 // armed reports whether the next request is expected on a known connection, so that chase may wait

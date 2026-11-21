@@ -49,7 +49,8 @@ type Server struct {
 	Token string
 	// DefaultHost stands in for a missing Host header when handlers build absolute URLs.
 	DefaultHost string
-	// IO selects the socket I/O loop: IONetpoll (also the meaning of ""), IOEpoll or IOThreads.
+	// IO selects the socket I/O loop: IONetpoll (also the meaning of ""), IOEpoll, IOThreads or
+	// IOHybrid.
 	IO string
 	// Predict, DeferAccept and Count are options of the epoll loop; the netpoll loop ignores the
 	// first two.
@@ -63,13 +64,15 @@ type Server struct {
 	DeferAccept bool
 	// Count keeps the counters that StatsLine reports.
 	Count bool
-	// Yield is an option of the threads loop: a connection's goroutine passes through the scheduler
+	// Yield is an option of the threads loop, and of the hybrid loop for the connections it serves
+	// in the same way: a connection's goroutine passes through the scheduler
 	// before it waits for a request once this much time has gone by since it last did (threads_linux.go
 	// says why). 0 means the default of 5 ms; a negative value means never.
 	Yield time.Duration
 
 	stats        *ioStats
 	predictAfter int // tests: arm the predictive read after this many exchanges; 0 = the default
+	hybridAfter  int // tests: the hybrid loop lends a connection after this streak; 0 = the default
 	once         sync.Once
 	bearer       []byte // "Bearer <Token>", the exact header value the suite's clients send
 	defaultHost  []byte
@@ -77,6 +80,7 @@ type Server struct {
 	pool         sync.Pool
 	stopping     atomic.Bool
 	threads      atomic.Pointer[threads] // the threads loop while it is serving, for Shutdown
+	hybrid       atomic.Pointer[hybrid]  // the same for the hybrid loop's lent connections
 }
 
 func (s *Server) init() {
@@ -123,8 +127,8 @@ func Listen() (*net.TCPListener, error) {
 	}
 }
 
-// The three ways the engine can do its socket I/O. Everything above the sockets (parsing, dispatch,
-// response assembly, buffer management) is the same code in both.
+// The four ways the engine can do its socket I/O. Everything above the sockets (parsing, dispatch,
+// response assembly, buffer management) is the same code in all of them.
 const (
 	// IONetpoll is the portable default: one goroutine per connection on Go's net package.
 	IONetpoll = "netpoll"
@@ -135,11 +139,15 @@ const (
 	// socket (Linux only): one read and one write per exchange, at the price of a thread per open
 	// connection. Connections beyond threadsMax are served the IONetpoll way.
 	IOThreads = "threads"
+	// IOHybrid is the epoll loop, which lends a connection that is clearly being used alone, one
+	// request after the other, to a goroutine that serves it the IOThreads way, and takes it back
+	// when it goes quiet (Linux only). It wants GOMAXPROCS of 4 or more.
+	IOHybrid = "hybrid"
 )
 
-// Serve serves connections until the listener is closed (or, for the epoll and threads loops, until
-// Shutdown). With IO set to IOEpoll or IOThreads on a platform that has no such loop, it serves
-// with IONetpoll.
+// Serve serves connections until the listener is closed (or, for the epoll, threads and hybrid
+// loops, until Shutdown). With IO set to IOEpoll, IOThreads or IOHybrid on a platform that has no
+// such loop, it serves with IONetpoll.
 func (s *Server) Serve(ln *net.TCPListener) error {
 	s.init()
 	switch {
@@ -147,6 +155,8 @@ func (s *Server) Serve(ln *net.TCPListener) error {
 		return s.serveEpoll(ln)
 	case s.IO == IOThreads && ThreadsSupported:
 		return s.serveThreads(ln)
+	case s.IO == IOHybrid && HybridSupported:
+		return s.serveHybrid(ln)
 	}
 	return s.serveNetpoll(ln)
 }
@@ -159,6 +169,9 @@ func (s *Server) Shutdown(ln *net.TCPListener) {
 	ln.Close()
 	if th := s.threads.Load(); th != nil {
 		th.halt()
+	}
+	if hy := s.hybrid.Load(); hy != nil {
+		hy.halt()
 	}
 }
 
@@ -202,6 +215,11 @@ func (s *Server) StatsLine() string {
 		io = IOEpoll
 	case s.IO == IOThreads && ThreadsSupported:
 		io = IOThreads
+	case s.IO == IOHybrid && HybridSupported:
+		io = IOHybrid
+	}
+	if hy := s.hybrid.Load(); hy != nil {
+		return s.stats.line(io) + hy.statsTail()
 	}
 	return s.stats.line(io)
 }
